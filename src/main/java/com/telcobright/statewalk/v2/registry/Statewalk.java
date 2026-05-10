@@ -5,6 +5,9 @@ import com.telcobright.statewalk.v2.event.EventTypeRegistry;
 import com.telcobright.statewalk.v2.event.StatemachineEvent;
 import com.telcobright.statewalk.v2.persistence.PersistenceProvider;
 import com.telcobright.statewalk.v2.pool.Poolable;
+import com.telcobright.statewalk.v2.state.StateConfig;
+
+import java.time.Duration;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -65,6 +68,7 @@ public final class Statewalk {
         private final EventTypeRegistry eventTypes = new EventTypeRegistry();
         private final Map<String, RegistryEntry> registries = new LinkedHashMap<>();
         private final List<ChannelBinding> channelBindings = new ArrayList<>();
+        private final Map<String, GlobalTimeoutOverride> globalTimeoutOverrides = new LinkedHashMap<>();
         private PersistenceProvider persistenceProvider;
         private boolean rehydrateEnabled;
 
@@ -151,6 +155,36 @@ public final class Statewalk {
         }
 
         /**
+         * Configure global timeout per registry. When the timeout fires for
+         * a machine, the framework transitions the machine to
+         * {@code targetState} — which <b>must be a final state</b>. The
+         * final state's entry action runs and the standard 8-step
+         * termination ritual reclaims the machine.
+         *
+         * <p>If this is not called for a registry, the timeout falls back
+         * to the subclass's {@code getGlobalTimeoutMs()} +
+         * {@code getGlobalTimeoutTargetState()} hooks. With both unset,
+         * global timeout is disabled (legacy {@code forceCleanupMachine}
+         * fires only as a manual operator action).
+         *
+         * @throws IllegalStateException at {@link #build()} if the target
+         *     state isn't declared in the machine's state graph or isn't
+         *     a final state.
+         */
+        public Builder globalTimeout(String registryName, Duration duration, String targetState) {
+            if (registryName == null) throw new IllegalArgumentException("registryName required");
+            if (duration == null || duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("duration must be > 0");
+            }
+            if (targetState == null || targetState.isBlank()) {
+                throw new IllegalArgumentException("targetState required");
+            }
+            globalTimeoutOverrides.put(registryName,
+                new GlobalTimeoutOverride(duration.toMillis(), targetState));
+            return this;
+        }
+
+        /**
          * Validate, initialise every registered registry, wire channels, and
          * return the runtime handle.
          *
@@ -170,9 +204,13 @@ public final class Statewalk {
             // Initialise registries — order matters for supervisor cross-refs,
             // but each registry is self-contained at init time.
             for (var entry : registries.values()) {
+                GlobalTimeoutOverride override = globalTimeoutOverrides.get(entry.name);
+                long timeoutMs = override != null ? override.durationMs : 0L;
+                String target  = override != null ? override.targetState : null;
                 entry.registry.initialize(
                     eventTypes, entry.poolSize, entry.timeoutThreads, entry.debugSampleRate,
-                    persistenceProvider, rehydrateEnabled);
+                    persistenceProvider, rehydrateEnabled,
+                    timeoutMs, target);
             }
 
             // Bind channels and wire inbound.
@@ -227,6 +265,32 @@ public final class Statewalk {
                     }
                 }
             }
+
+            // Global-timeout target state must be a declared final state.
+            // Validates BOTH builder overrides AND subclass-provided defaults,
+            // so misconfig is caught fast regardless of how the target was set.
+            for (var entry : registries.values()) {
+                GlobalTimeoutOverride override = globalTimeoutOverrides.get(entry.name);
+                String target = override != null
+                    ? override.targetState
+                    : entry.registry.getGlobalTimeoutTargetState();
+                if (target == null) continue;   // no target → no validation needed
+
+                var sample = entry.registry.createMachineTemplate();
+                var sm = sample.peekStateMap();
+                if (!sm.has(target)) {
+                    throw new IllegalStateException(
+                        "Registry '" + entry.name + "' global-timeout target state '" + target
+                        + "' is not declared in the machine's state graph.");
+                }
+                StateConfig tConfig = sm.get(target);
+                if (!tConfig.finalState()) {
+                    throw new IllegalStateException(
+                        "Registry '" + entry.name + "' global-timeout target state '" + target
+                        + "' is not a final state. Mark it with .finalState() in the machine's "
+                        + "state graph.");
+                }
+            }
         }
 
         @SuppressWarnings({"unchecked", "rawtypes"})
@@ -243,4 +307,5 @@ public final class Statewalk {
     record RegistryEntry(String name, Registry<?, ?> registry, int poolSize, int timeoutThreads,
                           int debugSampleRate) {}
     record ChannelBinding(String registryName, Channel<?, ?> channel) {}
+    record GlobalTimeoutOverride(long durationMs, String targetState) {}
 }

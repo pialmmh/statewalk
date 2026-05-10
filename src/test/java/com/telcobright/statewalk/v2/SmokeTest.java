@@ -357,6 +357,69 @@ class SmokeTest {
     }
 
     @Test
+    void global_timeout_transitions_to_configured_final_state() throws InterruptedException {
+        // A demo machine whose ACTIVE state has a 30s state-timeout to CLOSED
+        // (which is final). We configure a SHORTER (200 ms) GLOBAL timeout
+        // through the builder, also targeting CLOSED. The global timeout
+        // should fire first and transition the machine through CLOSED → reset.
+        DemoRegistry r = new DemoRegistry();
+        TestChannel<Object, StatemachineEvent> ch = new TestChannel<>();
+        StatewalkSystem sys = Statewalk.builder()
+            .registerEvent(Hello.class)
+            .registerEvent(Goodbye.class)
+            .registry("d", r, 8, 2)
+            .channel("d", ch)
+            .globalTimeout("d", Duration.ofMillis(200), "CLOSED")
+            .build();
+        try {
+            sys.dispatch("d", "gt-1", new DemoTask("timed-out"));
+            sys.awaitIdle(AWAIT);
+            assertNotNull(r.getMachine("gt-1"));
+
+            // Wait past the global timeout
+            Thread.sleep(400);
+            sys.awaitIdle(AWAIT);
+
+            // Machine transitioned to CLOSED (final) → ritual ran → gone.
+            assertNull(r.getMachine("gt-1"),
+                "machine should have terminated via global timeout → CLOSED");
+            assertEquals(1, r.getTotalCompleted());
+        } finally {
+            sys.shutdown();
+        }
+    }
+
+    @Test
+    void global_timeout_with_non_final_target_is_rejected_at_build() {
+        DemoRegistry r = new DemoRegistry();
+        // ACTIVE is NOT a final state in DemoMachine — using it as the
+        // global-timeout target must fail validation at build().
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+            Statewalk.builder()
+                .registerEvent(Hello.class)
+                .registerEvent(Goodbye.class)
+                .registry("d", r, 8, 2)
+                .globalTimeout("d", Duration.ofSeconds(1), "ACTIVE")
+                .channel("d", new TestChannel<>())
+                .build());
+        assertTrue(ex.getMessage().contains("not a final state"));
+    }
+
+    @Test
+    void global_timeout_with_unknown_target_is_rejected_at_build() {
+        DemoRegistry r = new DemoRegistry();
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+            Statewalk.builder()
+                .registerEvent(Hello.class)
+                .registerEvent(Goodbye.class)
+                .registry("d", r, 8, 2)
+                .globalTimeout("d", Duration.ofSeconds(1), "NOPE")
+                .channel("d", new TestChannel<>())
+                .build());
+        assertTrue(ex.getMessage().contains("not declared"));
+    }
+
+    @Test
     void registry_init_validates_pool_size_and_concurrent() {
         class BadRegistry extends Registry<DemoMachine, DemoContext> {
             @Override protected String getRegistryName()    { return "bad"; }

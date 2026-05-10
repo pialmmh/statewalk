@@ -126,6 +126,22 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     }
 
     /**
+     * Subclass hook: name of the state to transition to when the global
+     * timeout fires. <b>Must be a final state.</b> The builder may override
+     * this via {@code Statewalk.builder().globalTimeout(...)}.
+     *
+     * <p>Default {@code null} preserves the legacy behaviour
+     * ({@link #forceCleanupMachine} on timeout). With a target state set,
+     * the registry instead submits a {@link Machine#transitionTo} to the
+     * target — which by builder validation is final, so the machine runs
+     * its terminal entry action and is reclaimed through the standard
+     * 8-step ritual.
+     */
+    protected String getGlobalTimeoutTargetState() {
+        return null;
+    }
+
+    /**
      * Subclass hook: build a task object from a first-message event.
      * Called by {@link #onInboundEvent(String, StatemachineEvent)} when an
      * event with {@code isFirst() == true} arrives for an unknown machine id
@@ -220,6 +236,18 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     /** Per-machine quota keys captured at dispatch — needed to release on terminate. */
     private final ConcurrentHashMap<String, QuotaKeys> dispatchQuotaKeys = new ConcurrentHashMap<>();
 
+    /**
+     * Effective global-timeout target state — builder override of
+     * {@link #getGlobalTimeoutTargetState()}, or that subclass value if no
+     * builder override. When non-null, global-timeout fires transition the
+     * machine to this state via {@link Machine#transitionTo}; when null,
+     * legacy {@link #forceCleanupMachine} is used.
+     */
+    private volatile String effectiveGlobalTimeoutTargetState;
+
+    /** Effective global timeout (ms). Builder override of {@link #getGlobalTimeoutMs()}. */
+    private volatile long effectiveGlobalTimeoutMs;
+
     // ─────────────────────────────────────────────────────────────────
     // Initialisation — package-private; only Statewalk.Builder may call.
     // ─────────────────────────────────────────────────────────────────
@@ -235,7 +263,8 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
      */
     final void initialize(EventTypeRegistry eventTypes, int poolSize, int timeoutThreads,
                           int debugSampleRate,
-                          PersistenceProvider persistenceProvider, boolean rehydrateEnabled) {
+                          PersistenceProvider persistenceProvider, boolean rehydrateEnabled,
+                          long globalTimeoutMsOverride, String globalTimeoutTargetStateOverride) {
         validateInit(poolSize, timeoutThreads);
         if (initialized) {
             throw new IllegalStateException(getRegistryName() + " already initialized");
@@ -244,20 +273,23 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
         this.debugSampleRate = Math.max(0, debugSampleRate);
         this.persistenceProvider = persistenceProvider;
         this.rehydrateEnabled = rehydrateEnabled;
+        this.effectiveGlobalTimeoutMs = globalTimeoutMsOverride > 0
+            ? globalTimeoutMsOverride : getGlobalTimeoutMs();
+        this.effectiveGlobalTimeoutTargetState = globalTimeoutTargetStateOverride != null
+            ? globalTimeoutTargetStateOverride : getGlobalTimeoutTargetState();
         this.timeoutManager = new TimeoutManager(getRegistryName(), Math.max(2, timeoutThreads));
         this.machinePool = new ObjectPoolManager<>(
             getRegistryName() + "-MachinePool",
             this::createMachineTemplate,
             poolSize);
-        // Executor sized at 4× maxConcurrent so a peak burst of dispatches
-        // doesn't immediately fall back to inline. Tunable later.
         this.machineWork = new BoundedVirtualThreadExecutor(
             getRegistryName(),
             Math.max(16, getMaxConcurrent() * 4));
         this.initialized = true;
-        LOG.info("[{}] initialized poolSize={} timeoutThreads={} debugSampleRate={} persistence={} rehydrate={}",
+        LOG.info("[{}] initialized poolSize={} timeoutThreads={} debugSampleRate={} persistence={} rehydrate={} globalTimeoutMs={} timeoutTarget={}",
             getRegistryName(), poolSize, timeoutThreads, this.debugSampleRate,
-            persistenceProvider != null, rehydrateEnabled);
+            persistenceProvider != null, rehydrateEnabled,
+            this.effectiveGlobalTimeoutMs, this.effectiveGlobalTimeoutTargetState);
     }
 
     /**
@@ -644,15 +676,32 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     // ─────────────────────────────────────────────────────────────────
 
     private void scheduleGlobalTimeout(String requestId) {
-        long ms = getGlobalTimeoutMs();
+        long ms = effectiveGlobalTimeoutMs;
         if (ms <= 0) return;
         timeoutManager.scheduleTracked(
             "global:" + requestId,
             () -> {
-                M m = activeMachines.get(requestId);
-                if (m != null && !m.isTerminated()) {
-                    LOG.info("[{}] global timeout fired id={} state={}",
-                        getRegistryName(), requestId, m.getCurrentState());
+                final M m = activeMachines.get(requestId);
+                if (m == null || m.isTerminated()) return;
+                LOG.info("[{}] global timeout fired id={} state={} → {}",
+                    getRegistryName(), requestId, m.getCurrentState(),
+                    effectiveGlobalTimeoutTargetState != null
+                        ? "transition to " + effectiveGlobalTimeoutTargetState
+                        : "force cleanup (no target configured)");
+                if (effectiveGlobalTimeoutTargetState != null) {
+                    // Transition to the configured final state — runs current
+                    // state's exit + target's entry; entry of final triggers
+                    // the standard 8-step termination ritual.
+                    chainSubmit(requestId, () -> {
+                        try {
+                            if (!m.isTerminated()) m.transitionTo(effectiveGlobalTimeoutTargetState);
+                        } catch (Throwable t) {
+                            LOG.error("[{}] global-timeout transition threw for id={}: {} — force-cleaning",
+                                getRegistryName(), requestId, t.toString());
+                            forceCleanupMachine(requestId);
+                        }
+                    });
+                } else {
                     forceCleanupMachine(requestId);
                 }
             },

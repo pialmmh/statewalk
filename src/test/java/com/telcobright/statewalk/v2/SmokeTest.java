@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -79,9 +80,16 @@ class SmokeTest {
 
     // ─────────────────────────────────────────────────────────────────
 
+    private static final Duration AWAIT = Duration.ofSeconds(2);
+
     private StatewalkSystem system;
     private DemoRegistry demo;
     private TestChannel<Object, StatemachineEvent> channel;
+
+    /** Drain the framework's executor so test assertions see post-dispatch state. */
+    private void await() throws InterruptedException {
+        if (system != null) assertTrue(system.awaitIdle(AWAIT), "executor did not drain in " + AWAIT);
+    }
 
     @BeforeEach
     void setUp() {
@@ -110,8 +118,9 @@ class SmokeTest {
     }
 
     @Test
-    void dispatch_transitions_to_initial_state() {
+    void dispatch_transitions_to_initial_state() throws InterruptedException {
         assertTrue(system.dispatch("demo", "req-1", new DemoTask("hello")));
+        await();
         DemoMachine m = demo.getMachine("req-1");
         assertNotNull(m);
         assertEquals("ACTIVE", m.getCurrentState());
@@ -120,11 +129,12 @@ class SmokeTest {
     }
 
     @Test
-    void inbound_event_drives_stay_action() {
+    void inbound_event_drives_stay_action() throws InterruptedException {
         system.dispatch("demo", "req-2", new DemoTask("loop"));
         channel.inject("req-2", new Hello());
         channel.inject("req-2", new Hello());
         channel.inject("req-2", new Hello());
+        await();
 
         DemoMachine m = demo.getMachine("req-2");
         assertEquals(3, m.getContext().helloCount);
@@ -132,13 +142,15 @@ class SmokeTest {
     }
 
     @Test
-    void terminal_state_triggers_ritual_and_pool_return() {
+    void terminal_state_triggers_ritual_and_pool_return() throws InterruptedException {
         var before = demo.getPoolStatistics();
         system.dispatch("demo", "req-3", new DemoTask("done"));
+        await();
         DemoMachine m = demo.getMachine("req-3");
         DemoContext ctx = m.getContext();
 
         channel.inject("req-3", new Goodbye());
+        await();
 
         assertNull(demo.getMachine("req-3"));
         assertEquals(0, demo.getActiveCount());
@@ -151,23 +163,27 @@ class SmokeTest {
     }
 
     @Test
-    void late_event_after_terminal_is_silently_dropped() {
+    void late_event_after_terminal_is_silently_dropped() throws InterruptedException {
         system.dispatch("demo", "req-4", new DemoTask("late"));
         channel.inject("req-4", new Goodbye());
+        await();
         assertDoesNotThrow(() -> channel.inject("req-4", new Hello()));
+        await();
         assertNull(demo.getMachine("req-4"));
     }
 
     @Test
-    void duplicate_dispatch_on_same_id_is_rejected() {
+    void duplicate_dispatch_on_same_id_is_rejected() throws InterruptedException {
         assertTrue(system.dispatch("demo", "req-5", new DemoTask("first")));
         assertFalse(system.dispatch("demo", "req-5", new DemoTask("second")));
+        await();
         assertEquals(1, demo.getActiveCount());
     }
 
     @Test
-    void unregistered_event_throws_on_dispatch() {
+    void unregistered_event_throws_on_dispatch() throws InterruptedException {
         system.dispatch("demo", "req-6", new DemoTask("typed"));
+        await();
         IllegalStateException ex = assertThrows(IllegalStateException.class,
             () -> channel.inject("req-6", new Unregistered()));
         assertTrue(ex.getMessage().contains("not registered"));
@@ -198,7 +214,7 @@ class SmokeTest {
     }
 
     @Test
-    void debug_sample_rate_marks_every_nth_machine_in_debug_mode() {
+    void debug_sample_rate_marks_every_nth_machine_in_debug_mode() throws InterruptedException {
         DemoRegistry r = new DemoRegistry();
         TestChannel<Object, StatemachineEvent> ch = new TestChannel<>();
         StatewalkSystem sys = Statewalk.builder()
@@ -213,6 +229,7 @@ class SmokeTest {
             for (int i = 0; i < 9; i++) {
                 sys.dispatch("d", "m-" + i, new DemoTask("t" + i));
             }
+            sys.awaitIdle(AWAIT);
             assertTrue(r.getMachine("m-0").isDebugMode());
             assertFalse(r.getMachine("m-1").isDebugMode());
             assertFalse(r.getMachine("m-2").isDebugMode());
@@ -226,7 +243,7 @@ class SmokeTest {
     }
 
     @Test
-    void no_debug_sampling_when_rate_is_zero() {
+    void no_debug_sampling_when_rate_is_zero() throws InterruptedException {
         DemoRegistry r = new DemoRegistry();
         TestChannel<Object, StatemachineEvent> ch = new TestChannel<>();
         StatewalkSystem sys = Statewalk.builder()
@@ -238,6 +255,9 @@ class SmokeTest {
         try {
             for (int i = 0; i < 5; i++) {
                 sys.dispatch("d", "z-" + i, new DemoTask("t" + i));
+            }
+            sys.awaitIdle(AWAIT);
+            for (int i = 0; i < 5; i++) {
                 assertFalse(r.getMachine("z-" + i).isDebugMode());
             }
         } finally {
@@ -246,7 +266,7 @@ class SmokeTest {
     }
 
     @Test
-    void poolable_event_is_returned_to_pool_after_dispatch() {
+    void poolable_event_is_returned_to_pool_after_dispatch() throws InterruptedException {
         // Build a separate system with a poolable event registered.
         DemoRegistry r = new DemoRegistry();
         TestChannel<Object, StatemachineEvent> ch = new TestChannel<>();
@@ -258,6 +278,7 @@ class SmokeTest {
             .build();
         try {
             sys.dispatch("d", "p-1", new DemoTask("p"));
+            sys.awaitIdle(AWAIT);
 
             var stats0 = sys.getEventTypes().poolStatistics().get(PoolableHello.class);
             assertNotNull(stats0);
@@ -267,6 +288,7 @@ class SmokeTest {
             PoolableHello evt = sys.getEventTypes().borrow(PoolableHello.class);
             evt.payload = "x";
             ch.inject("p-1", evt);
+            sys.awaitIdle(AWAIT);
 
             var stats1 = sys.getEventTypes().poolStatistics().get(PoolableHello.class);
             assertEquals(returnedBefore + 1, stats1.totalReturned());
@@ -279,5 +301,75 @@ class SmokeTest {
     static class PoolableHello implements StatemachineEvent, com.telcobright.statewalk.v2.pool.Poolable {
         String payload;
         @Override public void resetForReuse() { payload = null; }
+    }
+
+    // ── new feature tests (offline + validation) ──────────────────────
+
+    @Test
+    void offline_state_and_final_state_are_mutually_exclusive_at_build_time() {
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+            StateMap.builder()
+                .initialState("A")
+                .state("A")
+                    .timeout(1, TimeUnit.SECONDS, "Z")
+                    .on(Hello.class, "Z")
+                .state("Z")
+                    .finalState()
+                    .offline()                    // illegal combo
+                    .timeout(1, TimeUnit.SECONDS, "Z")
+                .build());
+        assertTrue(ex.getMessage().contains("cannot be both final and offline"));
+    }
+
+    @Test
+    void offline_state_without_persistence_is_rejected_by_builder() {
+        // A registry whose machine has an offline state — but no persistence configured.
+        class OfflineMachine extends Machine<DemoTask, DemoContext> {
+            @Override protected StateMap defineStates() {
+                return StateMap.builder()
+                    .initialState("WAIT")
+                    .state("WAIT")
+                        .timeout(1, TimeUnit.SECONDS, "DONE")
+                        .offline()
+                        .on(Hello.class, "DONE")
+                    .state("DONE")
+                        .finalState()
+                        .timeout(1, TimeUnit.SECONDS, "DONE")
+                    .build();
+            }
+            @Override protected DemoContext createContext() { return new DemoContext(); }
+        }
+        class OfflineRegistry extends Registry<OfflineMachine, DemoContext> {
+            @Override protected String getRegistryName()    { return "off"; }
+            @Override protected int    getMaxConcurrent()   { return 16; }
+            @Override protected long   getGlobalTimeoutMs() { return 60_000L; }
+            @Override protected OfflineMachine createMachineTemplate() { return new OfflineMachine(); }
+        }
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+            Statewalk.builder()
+                .registerEvent(Hello.class)
+                .registerEvent(Goodbye.class)
+                .registry("off", new OfflineRegistry(), 8, 2)
+                .build());
+        assertTrue(ex.getMessage().contains("offline"));
+        assertTrue(ex.getMessage().contains("persistence"));
+    }
+
+    @Test
+    void registry_init_validates_pool_size_and_concurrent() {
+        class BadRegistry extends Registry<DemoMachine, DemoContext> {
+            @Override protected String getRegistryName()    { return "bad"; }
+            @Override protected int    getMaxConcurrent()   { return 0; }   // illegal
+            @Override protected long   getGlobalTimeoutMs() { return 60_000L; }
+            @Override protected DemoMachine createMachineTemplate() { return new DemoMachine(); }
+        }
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+            Statewalk.builder()
+                .registerEvent(Hello.class)
+                .registerEvent(Goodbye.class)
+                .registry("bad", new BadRegistry(), 8, 2)
+                .build());
+        assertTrue(ex.getMessage().contains("getMaxConcurrent"));
     }
 }

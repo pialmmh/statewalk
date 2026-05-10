@@ -26,6 +26,13 @@ import java.util.function.Consumer;
  * @param finalState  True if this is a terminal state. The framework wires
  *                    {@code finalState onEntry -> registry.onMachineTerminated}
  *                    and {@code reset() -> IDLE}.
+ * @param offline     True if this is an offline (suspend) state. On entry, the
+ *                    machine notifies the registry; the registry persists the
+ *                    snapshot and removes the machine from the active map +
+ *                    returns it to the pool. The machine resumes via the normal
+ *                    rehydration path on the next inbound event. Final and
+ *                    offline are mutually exclusive — builder rejects the
+ *                    combination.
  */
 public record StateConfig(
     String name,
@@ -34,7 +41,8 @@ public record StateConfig(
     Map<Class<? extends StatemachineEvent>, String> transitions,
     Map<Class<? extends StatemachineEvent>, BiConsumer<Object, StatemachineEvent>> stayActions,
     Timeout timeout,
-    boolean finalState
+    boolean finalState,
+    boolean offline
 ) {
     public record Timeout(long duration, TimeUnit unit, String targetState) {}
 }

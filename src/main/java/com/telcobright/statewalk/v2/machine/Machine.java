@@ -145,6 +145,18 @@ public abstract class Machine<E, C> implements Poolable {
     public final boolean isInState(String name) { return currentState.equals(name); }
     public final boolean isIdle() { return StateMap.IDLE.equals(currentState); }
 
+    /**
+     * Build (lazily) and return the state graph without starting the machine.
+     * Used by the framework's top-level builder to validate that every
+     * registry's states are consistent with the supplied configuration —
+     * for example, that persistence is configured when an offline state is
+     * declared.
+     */
+    public final StateMap peekStateMap() {
+        if (stateMap == null) stateMap = defineStates();
+        return stateMap;
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Lifecycle (final — skeleton not overridable)
     // ─────────────────────────────────────────────────────────────────
@@ -279,14 +291,25 @@ public abstract class Machine<E, C> implements Poolable {
             try { next.onEntry().accept(this); } catch (RuntimeException ignored) {}
         }
 
-        // 5b. notify registry for persistence (no-op if persistence disabled)
+        // 5b. notify registry — fires on EVERY transition. Persistence (if
+        // configured) hangs off of this; so does last-event-time tracking,
+        // metrics, etc. The registry decides what to do; the machine just
+        // tells it "I moved."
         long deadlineMs = next.timeout() != null
             ? System.currentTimeMillis() + next.timeout().unit().toMillis(next.timeout().duration())
             : 0L;
         String timeoutTarget = next.timeout() != null ? next.timeout().targetState() : null;
         registry.onStateTransitioned(machineId, next.name(), deadlineMs, timeoutTarget);
 
-        // 6. terminal? signal registry
+        // 6a. offline? notify registry to suspend. Per spec, the offline
+        // state's exit action is NOT fired during this transition — the
+        // machine is being suspended, not leaving the state.
+        if (next.offline() && !terminated) {
+            registry.onMachineWentOffline(machineId);
+            return;
+        }
+
+        // 6b. terminal? signal registry to run the 8-step ritual.
         if (next.finalState() && !terminated) {
             terminated = true;
             registry.onMachineReachedTerminal(machineId);
@@ -439,8 +462,9 @@ public abstract class Machine<E, C> implements Poolable {
 
         /**
          * Called after every successful state transition (entry action ran
-         * cleanly). Registry uses this to persist a snapshot when a
-         * persistence provider is configured. No-op otherwise.
+         * cleanly). Registry hooks any cross-cutting concern off this
+         * notification: persistence save, last-event-time update for hung
+         * detection, metrics, custom listeners.
          *
          * @param newState           the state just entered
          * @param timeoutDeadlineMs  wall-clock epoch millis when the state's
@@ -451,5 +475,15 @@ public abstract class Machine<E, C> implements Poolable {
          */
         default void onStateTransitioned(String machineId, String newState,
                                          long timeoutDeadlineMs, String timeoutTargetState) {}
+
+        /**
+         * Called by the machine when it enters a state declared
+         * {@code .offline()}. The registry persists the snapshot (already
+         * saved by {@link #onStateTransitioned}), removes the machine from
+         * the active map, and returns it to the pool. The machine is NOT
+         * terminated — a later inbound event for the same id rehydrates it
+         * via the normal rehydration path.
+         */
+        default void onMachineWentOffline(String machineId) {}
     }
 }

@@ -1,8 +1,14 @@
 package com.telcobright.statewalk.v2.registry;
 
+import com.telcobright.statewalk.v2.admission.DispatchResult;
+import com.telcobright.statewalk.v2.admission.QuotaController;
+import com.telcobright.statewalk.v2.admission.QuotaKeys;
+import com.telcobright.statewalk.v2.admission.QuotaLimits;
+import com.telcobright.statewalk.v2.admission.RejectCause;
 import com.telcobright.statewalk.v2.channel.Channel;
 import com.telcobright.statewalk.v2.event.EventTypeRegistry;
 import com.telcobright.statewalk.v2.event.StatemachineEvent;
+import com.telcobright.statewalk.v2.executor.BoundedVirtualThreadExecutor;
 import com.telcobright.statewalk.v2.machine.Machine;
 import com.telcobright.statewalk.v2.persistence.MachineSnapshot;
 import com.telcobright.statewalk.v2.persistence.PersistenceProvider;
@@ -102,6 +108,24 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     protected void onShutdown() {}
 
     /**
+     * Subclass hook: extract quota keys from a task. Default returns
+     * {@link QuotaKeys#NONE} (no quota dimensions). Override to return
+     * partner / route keys from the task — e.g.
+     * {@code QuotaKeys.of(task.partnerId(), task.routeId())}.
+     */
+    protected QuotaKeys quotaKeysFor(Object task) {
+        return QuotaKeys.NONE;
+    }
+
+    /**
+     * Subclass hook: declare quota limits. Default is unlimited. Override
+     * to set per-partner / per-route concurrent and TPS thresholds.
+     */
+    protected QuotaLimits getQuotaLimits() {
+        return QuotaLimits.UNLIMITED;
+    }
+
+    /**
      * Subclass hook: build a task object from a first-message event.
      * Called by {@link #onInboundEvent(String, StatemachineEvent)} when an
      * event with {@code isFirst() == true} arrives for an unknown machine id
@@ -127,10 +151,31 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     protected ObjectPoolManager<M> machinePool;
     protected TimeoutManager timeoutManager;
 
+    /**
+     * Bounded virtual-thread executor for machine work — entry actions,
+     * event dispatch, terminal cleanup, persistence saves. Channel threads
+     * submit work here and return immediately. Per-machine ordering is
+     * preserved by {@code synchronized} on Machine.fire / transitionTo.
+     */
+    protected BoundedVirtualThreadExecutor machineWork;
+
     protected final ConcurrentHashMap<String, M> activeMachines = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> startTimeMs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> lastEventTimeMs = new ConcurrentHashMap<>();
     private final Set<String> terminatedRequests = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Per-machine FIFO dispatch chains. Each machineId has a
+     * {@link java.util.concurrent.CompletableFuture} chain — every submitted
+     * task is appended via {@code thenRunAsync}, guaranteeing in-order
+     * processing per machine while different machines run in parallel on
+     * the bounded VT executor.
+     *
+     * <p>Entries are removed when the machine terminates or goes offline —
+     * keeps the map bounded by the active-machine count.
+     */
+    private final ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Void>> chains =
+        new ConcurrentHashMap<>();
 
     protected volatile boolean initialized = false;
     protected final AtomicBoolean shuttingDown = new AtomicBoolean(false);
@@ -169,6 +214,12 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
      */
     private volatile boolean rehydrateEnabled;
 
+    /** Per-key concurrent + TPS quota tracker. Always present; no-op if limits unset. */
+    private final QuotaController quotaController = new QuotaController();
+
+    /** Per-machine quota keys captured at dispatch — needed to release on terminate. */
+    private final ConcurrentHashMap<String, QuotaKeys> dispatchQuotaKeys = new ConcurrentHashMap<>();
+
     // ─────────────────────────────────────────────────────────────────
     // Initialisation — package-private; only Statewalk.Builder may call.
     // ─────────────────────────────────────────────────────────────────
@@ -185,6 +236,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     final void initialize(EventTypeRegistry eventTypes, int poolSize, int timeoutThreads,
                           int debugSampleRate,
                           PersistenceProvider persistenceProvider, boolean rehydrateEnabled) {
+        validateInit(poolSize, timeoutThreads);
         if (initialized) {
             throw new IllegalStateException(getRegistryName() + " already initialized");
         }
@@ -197,10 +249,41 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
             getRegistryName() + "-MachinePool",
             this::createMachineTemplate,
             poolSize);
+        // Executor sized at 4× maxConcurrent so a peak burst of dispatches
+        // doesn't immediately fall back to inline. Tunable later.
+        this.machineWork = new BoundedVirtualThreadExecutor(
+            getRegistryName(),
+            Math.max(16, getMaxConcurrent() * 4));
         this.initialized = true;
         LOG.info("[{}] initialized poolSize={} timeoutThreads={} debugSampleRate={} persistence={} rehydrate={}",
             getRegistryName(), poolSize, timeoutThreads, this.debugSampleRate,
             persistenceProvider != null, rehydrateEnabled);
+    }
+
+    /**
+     * Validate subclass-supplied + builder-supplied parameters. Throws on
+     * any violation — this fires once at startup, never on the dispatch
+     * path.
+     */
+    private void validateInit(int poolSize, int timeoutThreads) {
+        String name = getRegistryName();
+        if (name == null || name.isBlank()) {
+            throw new IllegalStateException("getRegistryName() returned blank");
+        }
+        if (poolSize <= 0) {
+            throw new IllegalStateException("[" + name + "] poolSize must be > 0 (got " + poolSize + ")");
+        }
+        if (timeoutThreads <= 0) {
+            throw new IllegalStateException("[" + name + "] timeoutThreads must be > 0 (got " + timeoutThreads + ")");
+        }
+        int maxConc = getMaxConcurrent();
+        if (maxConc <= 0) {
+            throw new IllegalStateException("[" + name + "] getMaxConcurrent() must be > 0 (got " + maxConc + ")");
+        }
+        long globalTo = getGlobalTimeoutMs();
+        if (globalTo < 0) {
+            throw new IllegalStateException("[" + name + "] getGlobalTimeoutMs() must be >= 0 (got " + globalTo + ")");
+        }
     }
 
     /**
@@ -214,6 +297,29 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
 
     public final Channel<?, ?> getChannel(String name) { return channels.get(name); }
 
+    /**
+     * Submit a task to run for {@code requestId} after every previously-
+     * submitted task for the same id has completed. Per-machineId FIFO
+     * is enforced via a {@link java.util.concurrent.CompletableFuture} chain.
+     */
+    private void chainSubmit(String requestId, Runnable task) {
+        chains.compute(requestId, (k, prev) -> {
+            java.util.concurrent.CompletableFuture<Void> base =
+                (prev == null) ? java.util.concurrent.CompletableFuture.completedFuture(null) : prev;
+            return base.thenRunAsync(() -> {
+                try { task.run(); }
+                catch (Throwable t) {
+                    LOG.warn("[{}] chain task threw for id={}: {}", getRegistryName(), requestId, t.toString());
+                }
+            }, machineWork.asExecutor());
+        });
+    }
+
+    /** Drop a machine's chain entry — called on terminal / offline. */
+    private void clearChain(String requestId) {
+        chains.remove(requestId);
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Dispatch (final — borrow + assertIDLE + register + start)
     // ─────────────────────────────────────────────────────────────────
@@ -222,20 +328,43 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
      * Borrow a machine, bind it to {@code requestId} + {@code task}, register
      * it as active, schedule the global timeout, and start it.
      *
-     * @return true on success, false on capacity / shutdown / duplicate id.
+     * <p>Convenience overload — returns {@code true} on accept, {@code false}
+     * on any rejection. Use {@link #dispatchWithResult(String, Object)} when
+     * the rejection cause matters (e.g. to formulate a wire-level response).
      */
     public final boolean dispatch(String requestId, Object task) {
-        if (shuttingDown.get() || !initialized) return false;
-        if (activeMachines.size() >= getMaxConcurrent()) return false;
+        return dispatchWithResult(requestId, task).accepted();
+    }
+
+    /**
+     * Same as {@link #dispatch} but returns a {@link DispatchResult} carrying
+     * the {@link RejectCause} on rejection. Used by the call handler to
+     * translate to protocol-level cause codes when responding to the wire.
+     *
+     * <p>Quota enforcement happens here, before any pool borrow. Subclass
+     * hooks {@link #quotaKeysFor(Object)} and {@link #getQuotaLimits()}
+     * configure the per-partner / per-route checks.
+     */
+    public final DispatchResult dispatchWithResult(String requestId, Object task) {
+        if (shuttingDown.get())            return DispatchResult.rejected(RejectCause.SHUTTING_DOWN);
+        if (!initialized)                  return DispatchResult.rejected(RejectCause.NOT_INITIALIZED);
+        if (activeMachines.size() >= getMaxConcurrent())
+                                            return DispatchResult.rejected(RejectCause.CAPACITY_EXCEEDED);
+
+        // Quota check BEFORE borrowing the machine — cheaper to reject early.
+        QuotaKeys keys = quotaKeysFor(task);
+        QuotaLimits limits = getQuotaLimits();
+        RejectCause quotaReject = quotaController.tryAcquire(keys, limits);
+        if (quotaReject != null) {
+            return DispatchResult.rejected(quotaReject);
+        }
 
         M machine = machinePool.borrow();
-
-        // IDLE invariant assertion — pool entries must be IDLE.
         if (!machine.isIdle()) {
-            // Drop the bad instance; allocate fresh and retry once.
             machine = machinePool.borrow();
             if (!machine.isIdle()) {
-                return false; // pool integrity broken; bail.
+                quotaController.release(keys);   // roll back quota acquire
+                return DispatchResult.rejected(RejectCause.POOL_INTEGRITY_ERROR);
             }
         }
 
@@ -255,11 +384,14 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
         // Race guard: refuse second dispatch on the same id.
         M prior = activeMachines.putIfAbsent(requestId, machine);
         if (prior != null) {
-            // Another thread won; return our borrow.
             machine.setDebugMode(false);
             machinePool.returnObject(machine);
-            return false;
+            quotaController.release(keys);   // roll back quota acquire
+            return DispatchResult.rejected(RejectCause.DUPLICATE_ID);
         }
+
+        // Track quota keys for release on terminate / offline.
+        if (keys != QuotaKeys.NONE) dispatchQuotaKeys.put(requestId, keys);
 
         long now = System.currentTimeMillis();
         startTimeMs.put(requestId, now);
@@ -267,9 +399,20 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
         totalStarted.incrementAndGet();
 
         scheduleGlobalTimeout(requestId);
-        machine.start();
         LOG.info("[{}] machine created id={} debug={}", getRegistryName(), requestId, debug);
-        return true;
+
+        // Start the machine asynchronously through the per-id FIFO chain.
+        final M m = machine;
+        chainSubmit(requestId, () -> {
+            try {
+                m.start();
+            } catch (Throwable t) {
+                LOG.error("[{}] machine.start threw for id={}: {} — force-cleaning",
+                    getRegistryName(), requestId, t.toString());
+                forceCleanupMachine(requestId);
+            }
+        });
+        return DispatchResult.ok();
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -303,25 +446,47 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
         if (event == null) return;
 
         // Validate registration — throws on unregistered event classes.
+        // (Synchronous — caller wants the typo signal immediately.)
         if (eventTypes != null) eventTypes.requireRegistered(event.getClass());
 
-        try {
-            M m = activeMachines.get(requestId);
-            if (m == null) {
-                // Late event window: id was terminated within the last 60s.
-                // Silently drop — distinguishable from "unknown id" by the
-                // dedup set entry.
-                if (terminatedRequests.contains(requestId)) return;
-                m = resolveMachineForUnknownId(requestId, event);
-                if (m == null) return;   // creation / rehydrate produced nothing
-            }
-            if (m.isTerminated()) return;
-            lastEventTimeMs.put(requestId, System.currentTimeMillis());
-            m.fire(event);
-        } finally {
-            // Return poolable events even if dispatch dropped them.
+        // Late-event window — silently drop on the calling thread, no executor work.
+        if (terminatedRequests.contains(requestId)) {
             if (eventTypes != null) eventTypes.returnIfPoolable(event);
+            return;
         }
+
+        // Resolve the machine: lookup → isFirst auto-create → rehydrate.
+        // For the rehydrate path we need a synchronous load (the snapshot
+        // determines whether to dispatch, throw, or drop). The actual
+        // entry-action work then runs on the executor.
+        M m = activeMachines.get(requestId);
+        if (m == null) {
+            m = resolveMachineForUnknownId(requestId, event);
+            if (m == null) {
+                if (eventTypes != null) eventTypes.returnIfPoolable(event);
+                return;
+            }
+        }
+        if (m.isTerminated()) {
+            if (eventTypes != null) eventTypes.returnIfPoolable(event);
+            return;
+        }
+        lastEventTimeMs.put(requestId, System.currentTimeMillis());
+
+        // Hand the event off the channel thread. Per-id FIFO is preserved
+        // by the chain — events for the same machine process in submission
+        // order; different machines run in parallel.
+        final M machine = m;
+        chainSubmit(requestId, () -> {
+            try {
+                machine.fire(event);
+            } catch (Throwable t) {
+                LOG.warn("[{}] fire threw for id={} event={}: {}",
+                    getRegistryName(), requestId, event.getClass().getSimpleName(), t.toString());
+            } finally {
+                if (eventTypes != null) eventTypes.returnIfPoolable(event);
+            }
+        });
     }
 
     /**
@@ -398,6 +563,13 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     @Override
     public final void onStateTransitioned(String machineId, String newState,
                                            long timeoutDeadlineMs, String timeoutTargetState) {
+        // Always-on bookkeeping — regardless of persistence.
+        long now = System.currentTimeMillis();
+        if (lastEventTimeMs.containsKey(machineId)) {
+            lastEventTimeMs.put(machineId, now);
+        }
+
+        // Persistence, if configured.
         if (persistenceProvider == null) return;
         M m = activeMachines.get(machineId);
         if (m == null) return;
@@ -411,7 +583,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
                 newState,
                 ctxClass,
                 b64,
-                System.currentTimeMillis(),
+                now,
                 timeoutTargetState,
                 timeoutDeadlineMs);
             persistenceProvider.save(snap);
@@ -419,6 +591,52 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
             LOG.warn("[{}] persistence save failed for id={}: {}",
                 getRegistryName(), machineId, e.toString());
         }
+    }
+
+    @Override
+    public final void onMachineWentOffline(String machineId) {
+        // Offline only makes sense with persistence — otherwise a suspended
+        // machine has nowhere to go. Treat misconfig as a hard error so it
+        // surfaces in tests, not in mysterious lost calls.
+        if (persistenceProvider == null) {
+            LOG.error("[{}] machine {} entered offline state but persistence is not configured "
+                    + "— terminating instead. Add .persistence(...) to the Statewalk builder.",
+                getRegistryName(), machineId);
+            forceCleanupMachine(machineId);
+            return;
+        }
+
+        // Snapshot was already saved during onStateTransitioned. Just remove
+        // from active map and return to pool — without running the
+        // termination ritual (no handleTermination, no snapshot delete).
+        cancelGlobalTimeout(machineId);
+        Long started = startTimeMs.remove(machineId);
+        M machine = activeMachines.remove(machineId);
+        lastEventTimeMs.remove(machineId);
+        if (machine == null) return;
+
+        long durationMs = started != null ? System.currentTimeMillis() - started : -1L;
+        String state = machine.getCurrentState();
+
+        try { machine.resetForReuse(); }
+        catch (RuntimeException e) {
+            LOG.warn("[{}] reset threw during offline for id={}: {}",
+                getRegistryName(), machineId, e.toString());
+        }
+        if (machine.isIdle()) machinePool.returnObject(machine);
+
+        // Release quota slots (if any) — going offline frees the partner /
+        // route concurrent slot. If/when the machine rehydrates, it
+        // re-acquires through the standard rehydrate path.
+        QuotaKeys keys = dispatchQuotaKeys.remove(machineId);
+        if (keys != null) quotaController.release(keys);
+
+        // Drop the FIFO chain — when a future event arrives for this id,
+        // a fresh chain will start (rehydrated machine).
+        clearChain(machineId);
+
+        LOG.info("[{}] machine offline id={} state={} activeMs={}",
+            getRegistryName(), machineId, state, durationMs);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -514,6 +732,13 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
             }
         }
 
+        // Release quota slots (if any).
+        QuotaKeys keys = dispatchQuotaKeys.remove(requestId);
+        if (keys != null) quotaController.release(keys);
+
+        // Drop the FIFO chain entry — machine is gone.
+        clearChain(requestId);
+
         LOG.info("[{}] machine terminated id={} finalState={} durationMs={}",
             getRegistryName(), requestId, finalState, durationMs);
 
@@ -597,9 +822,55 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
         for (String id : new java.util.ArrayList<>(activeMachines.keySet())) {
             try { forceCleanupMachine(id); } catch (RuntimeException ignored) {}
         }
+
+        // Drain the executor before clearing pools — otherwise in-flight
+        // tasks may try to use cleared resources.
+        if (machineWork != null) {
+            try { machineWork.awaitIdle(5, TimeUnit.SECONDS); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            machineWork.close();
+        }
+
         activeMachines.clear();
         terminatedRequests.clear();
         if (machinePool != null) machinePool.clear();
         if (timeoutManager != null) timeoutManager.shutdown();
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Test-friendly synchronisation: wait for the executor to drain.
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Block until all in-flight machine work has completed (entry actions,
+     * event dispatches, terminal cleanups, persistence saves). Used by tests
+     * after dispatching events to deterministically synchronise with the
+     * executor.
+     *
+     * <p>In production, callers don't need this — the framework's async
+     * processing is the desired behaviour.
+     *
+     * @return true if drained within the timeout
+     */
+    public final boolean awaitIdle(long timeout, TimeUnit unit) throws InterruptedException {
+        long deadlineNs = System.nanoTime() + unit.toNanos(timeout);
+
+        // Snapshot current chains and join them — captures everything
+        // submitted up to this point.
+        for (var f : new java.util.ArrayList<>(chains.values())) {
+            long remainingNs = Math.max(0, deadlineNs - System.nanoTime());
+            try {
+                f.get(remainingNs, TimeUnit.NANOSECONDS);
+            } catch (java.util.concurrent.ExecutionException e) {
+                // Already logged inside chainSubmit; carry on.
+            } catch (java.util.concurrent.TimeoutException e) {
+                return false;
+            }
+        }
+        if (machineWork == null) return true;
+        long remainingNs = Math.max(0, deadlineNs - System.nanoTime());
+        return machineWork.awaitIdle(remainingNs, TimeUnit.NANOSECONDS);
+    }
+
+    public final BoundedVirtualThreadExecutor getMachineWorkExecutor() { return machineWork; }
 }

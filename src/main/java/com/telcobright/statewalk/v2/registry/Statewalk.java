@@ -213,6 +213,20 @@ public final class Statewalk {
                         "Channel bound to unknown registry: " + binding.registryName);
                 }
             }
+            // Offline states require a persistence provider — without one, a
+            // suspended machine has nowhere to live. Peek each registry's
+            // state map to detect this misconfig at startup.
+            if (persistenceProvider == null) {
+                for (var entry : registries.values()) {
+                    var sample = entry.registry.createMachineTemplate();
+                    if (sample.peekStateMap().hasOfflineState()) {
+                        throw new IllegalStateException(
+                            "Registry '" + entry.name + "' has at least one .offline() state but no "
+                            + "persistence provider is configured. Add .persistence(...) to the "
+                            + "Statewalk builder, or remove the offline marker.");
+                    }
+                }
+            }
         }
 
         @SuppressWarnings({"unchecked", "rawtypes"})

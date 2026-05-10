@@ -2,9 +2,11 @@ package com.telcobright.statewalk.v2.registry;
 
 import com.telcobright.statewalk.v2.event.EventTypeRegistry;
 
+import java.time.Duration;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Runtime handle returned by {@link Statewalk.Builder#build()}.
@@ -72,5 +74,24 @@ public final class StatewalkSystem {
         for (var entry : registries.values()) {
             try { entry.registry().shutdown(); } catch (RuntimeException ignored) {}
         }
+    }
+
+    /**
+     * Block until every registered registry's machine-work executor is idle.
+     * Used by tests after dispatching events to deterministically synchronise
+     * with the framework's async processing.
+     *
+     * <p>In production, callers don't need this — the async behaviour is the
+     * desired one.
+     *
+     * @return true if all registries drained within the timeout
+     */
+    public boolean awaitIdle(Duration timeout) throws InterruptedException {
+        long deadlineNs = System.nanoTime() + timeout.toNanos();
+        for (var entry : registries.values()) {
+            long remainingNs = Math.max(0, deadlineNs - System.nanoTime());
+            if (!entry.registry().awaitIdle(remainingNs, TimeUnit.NANOSECONDS)) return false;
+        }
+        return true;
     }
 }

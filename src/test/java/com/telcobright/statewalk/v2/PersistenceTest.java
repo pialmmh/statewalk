@@ -14,6 +14,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -146,11 +147,14 @@ class PersistenceTest {
 
     // ── tests ─────────────────────────────────────────────────────────
 
+    private static final Duration AWAIT = Duration.ofSeconds(2);
+
     @Test
-    void persistence_saves_on_every_transition() {
+    void persistence_saves_on_every_transition() throws InterruptedException {
         var sys = buildSystem(false);
         try {
             sys.dispatch("call", "c-1", new CallTask("+880x"));
+            sys.awaitIdle(AWAIT);
             // After dispatch: machine in RINGING. Snapshot saved.
             assertEquals(1, provider.size());
             MachineSnapshot s1 = provider.load("c-1").orElseThrow();
@@ -159,6 +163,7 @@ class PersistenceTest {
             assertNotNull(s1.contextJsonBase64());
 
             channel.inject("c-1", new Answered());
+            sys.awaitIdle(AWAIT);
             // Now in ANSWERED. New snapshot saved.
             MachineSnapshot s2 = provider.load("c-1").orElseThrow();
             assertEquals("ANSWERED", s2.currentState());
@@ -169,14 +174,16 @@ class PersistenceTest {
     }
 
     @Test
-    void terminal_state_deletes_the_snapshot() {
+    void terminal_state_deletes_the_snapshot() throws InterruptedException {
         var sys = buildSystem(false);
         try {
             sys.dispatch("call", "c-2", new CallTask("+880x"));
             channel.inject("c-2", new Answered());
+            sys.awaitIdle(AWAIT);
             assertTrue(provider.load("c-2").isPresent());
 
             channel.inject("c-2", new Hangup());
+            sys.awaitIdle(AWAIT);
             // COMPLETED is final → ritual deletes the snapshot.
             assertTrue(provider.load("c-2").isEmpty());
         } finally {
@@ -185,13 +192,9 @@ class PersistenceTest {
     }
 
     @Test
-    void rehydration_skips_entry_action_for_saved_state() {
-        // Pre-seed a snapshot directly (simulate a different process having
-        // persisted ANSWERED state earlier — current process never ran the
-        // entry actions).
+    void rehydration_skips_entry_action_for_saved_state() throws InterruptedException {
         long now = System.currentTimeMillis();
-        long deadlineMs = now + 60 * 60_000;  // 1 hour from now — not fired
-        // Construct a serialized CallContext payload.
+        long deadlineMs = now + 60 * 60_000;
         CallContext ctx = new CallContext();
         ctx.calledNumber = "+880x";
         ctx.answerCount = 1;
@@ -202,20 +205,14 @@ class PersistenceTest {
 
         var sys = buildSystem(true);
         try {
-            // Reset action counters AFTER setup.
             entryActionRuns.set(0);
             exitActionRuns.set(0);
 
-            // Inbound non-first event → should rehydrate, not throw.
             channel.inject("c-3", new Hangup());
+            sys.awaitIdle(AWAIT);
 
-            // Hangup in ANSWERED → COMPLETED (final). Then ritual.
-            assertNull(callReg.getMachine("c-3"));     // terminated, removed
-            assertTrue(provider.load("c-3").isEmpty());// snapshot deleted
-
-            // Entry action of ANSWERED was NOT replayed during rehydration —
-            // only ANSWERED.onExit (from Hangup→COMPLETED transition) and
-            // COMPLETED.onEntry should have run.
+            assertNull(callReg.getMachine("c-3"));
+            assertTrue(provider.load("c-3").isEmpty());
             assertEquals(1, entryActionRuns.get(),
                 "Only COMPLETED.onEntry should run; ANSWERED.onEntry must be skipped on rehydrate");
             assertEquals(1, exitActionRuns.get(),
@@ -226,10 +223,9 @@ class PersistenceTest {
     }
 
     @Test
-    void rehydration_with_elapsed_timeout_runs_exit_then_target() {
-        // Pre-seed a snapshot whose timeout has already fired.
+    void rehydration_with_elapsed_timeout_runs_exit_then_target() throws InterruptedException {
         long now = System.currentTimeMillis();
-        long elapsedDeadlineMs = now - 1_000;  // 1s ago — timeout fired
+        long elapsedDeadlineMs = now - 1_000;
         CallContext ctx = new CallContext();
         ctx.calledNumber = "+880x";
         String b64 = com.telcobright.statewalk.v2.persistence.SnapshotSerializer.contextToBase64Json(ctx);
@@ -242,16 +238,11 @@ class PersistenceTest {
             entryActionRuns.set(0);
             exitActionRuns.set(0);
 
-            // Any inbound event triggers rehydrate; rehydrate sees fired
-            // timeout and transitions RINGING → FAILED synchronously.
             channel.inject("c-4", new Hangup());
+            sys.awaitIdle(AWAIT);
 
-            // FAILED is final → terminated, snapshot deleted.
             assertNull(callReg.getMachine("c-4"));
             assertTrue(provider.load("c-4").isEmpty());
-
-            // RINGING.onExit + FAILED.onEntry should have run.
-            // (RINGING.onEntry is NOT replayed.)
             assertEquals(1, exitActionRuns.get(), "RINGING.onExit during fired-timeout transition");
             assertEquals(1, entryActionRuns.get(), "FAILED.onEntry on terminal arrival");
         } finally {
@@ -291,11 +282,12 @@ class PersistenceTest {
     }
 
     @Test
-    void isFirst_event_creates_a_new_machine() {
+    void isFirst_event_creates_a_new_machine() throws InterruptedException {
         var sys = buildSystem(true);
         try {
             // No prior dispatch — but the event is isFirst, so framework creates.
             channel.inject("c-7", new StartCall("+880abc"));
+            sys.awaitIdle(AWAIT);
 
             var m = callReg.getMachine("c-7");
             assertNotNull(m);

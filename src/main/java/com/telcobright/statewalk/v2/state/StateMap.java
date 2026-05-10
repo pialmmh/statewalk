@@ -50,6 +50,15 @@ public final class StateMap {
 
     public boolean has(String name) { return states.containsKey(name); }
 
+    /** True if any user-declared state is marked {@code .offline()}. Used by the
+     *  framework builder to require persistence when offline is in play. */
+    public boolean hasOfflineState() {
+        for (StateConfig c : states.values()) {
+            if (c.offline()) return true;
+        }
+        return false;
+    }
+
     public static Builder builder() { return new Builder(); }
 
     // ─────────────────────────────────────────────────────────────────
@@ -128,9 +137,19 @@ public final class StateMap {
                 }
             }
 
+            // Final ⊕ offline — mutually exclusive. Final states terminate;
+            // offline states suspend. Combining them is a contradiction.
+            for (StateBuilder sb : stateBuilders.values()) {
+                if (sb.finalState && sb.offline) {
+                    throw new IllegalStateException(
+                        "State '" + sb.name + "' cannot be both final and offline. "
+                        + "Final terminates the machine; offline suspends it. Choose one.");
+                }
+            }
+
             Map<String, StateConfig> built = new LinkedHashMap<>();
 
-            // Auto-inject IDLE (no actions, no transitions, not final).
+            // Auto-inject IDLE (no actions, no transitions, not final, not offline).
             built.put(IDLE, new StateConfig(
                 IDLE,
                 null,
@@ -138,6 +157,7 @@ public final class StateMap {
                 Collections.emptyMap(),
                 Collections.emptyMap(),
                 null,
+                false,
                 false));
 
             for (StateBuilder sb : stateBuilders.values()) {
@@ -151,9 +171,19 @@ public final class StateMap {
                     Collections.unmodifiableMap(new LinkedHashMap<>(sb.transitions)),
                     Collections.unmodifiableMap(new LinkedHashMap<>(sb.stayActions)),
                     to,
-                    sb.finalState));
+                    sb.finalState,
+                    sb.offline));
             }
             return new StateMap(initialState, built);
+        }
+
+        /** True if any user-declared state is marked offline. Used by the
+         *  framework builder to require persistence when offline is in play. */
+        public boolean hasOfflineState() {
+            for (StateBuilder sb : stateBuilders.values()) {
+                if (sb.offline) return true;
+            }
+            return false;
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -171,6 +201,7 @@ public final class StateMap {
             private TimeUnit timeoutUnit;
             private String timeoutTarget;
             private boolean finalState;
+            private boolean offline;
 
             StateBuilder(String name, Builder parent) {
                 this.name = name;
@@ -207,6 +238,28 @@ public final class StateMap {
 
             public StateBuilder finalState() {
                 this.finalState = true;
+                return this;
+            }
+
+            /**
+             * Mark this state as <b>offline</b> (suspend). On entry, the
+             * machine notifies the registry; the registry persists the
+             * snapshot, removes the machine from the active map, and returns
+             * it to the pool. The machine resumes via the normal rehydration
+             * path on the next inbound event.
+             *
+             * <p>Offline states cannot also be final — builder rejects the
+             * combination at {@link Builder#build()} time. Persistence MUST
+             * be configured at the framework builder when any state is
+             * offline; the framework builder validates this.
+             *
+             * <p>The state's exit action is NOT fired during the offline
+             * transition (the machine doesn't truly leave the state — it's
+             * suspended). When the machine is rehydrated and a later event
+             * triggers a transition, the exit action runs normally.
+             */
+            public StateBuilder offline() {
+                this.offline = true;
                 return this;
             }
 

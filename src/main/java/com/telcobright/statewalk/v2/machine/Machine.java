@@ -1,7 +1,7 @@
 package com.telcobright.statewalk.v2.machine;
 
-import com.telcobright.statewalk.v2.event.StatemachineEvent;
-import com.telcobright.statewalk.v2.event.TimeoutEvent;
+import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
+import com.telcobright.statewalk.v2.registry.consumes.TimeoutEvent;
 import com.telcobright.statewalk.v2.pool.Poolable;
 import com.telcobright.statewalk.v2.state.StateConfig;
 import com.telcobright.statewalk.v2.state.StateMap;

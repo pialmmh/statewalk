@@ -1,4 +1,4 @@
-package com.telcobright.statewalk.v2.admission;
+package com.telcobright.statewalk.v2.registry.api;
 
 /**
  * Quota thresholds for a registry. {@code 0} on any field disables that

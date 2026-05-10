@@ -1,6 +1,6 @@
 package com.telcobright.statewalk.v2.registry;
 
-import com.telcobright.statewalk.v2.event.EventTypeRegistry;
+import com.telcobright.statewalk.v2.registry.consumes.EventTypeRegistry;
 
 import java.time.Duration;
 import java.util.Collections;

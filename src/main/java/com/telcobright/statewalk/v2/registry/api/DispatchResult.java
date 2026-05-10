@@ -1,4 +1,4 @@
-package com.telcobright.statewalk.v2.admission;
+package com.telcobright.statewalk.v2.registry.api;
 
 /**
  * Outcome of a {@code Registry.dispatch} call. Successful dispatches return

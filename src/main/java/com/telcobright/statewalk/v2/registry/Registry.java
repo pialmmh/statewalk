@@ -1,13 +1,13 @@
 package com.telcobright.statewalk.v2.registry;
 
-import com.telcobright.statewalk.v2.admission.DispatchResult;
-import com.telcobright.statewalk.v2.admission.QuotaController;
-import com.telcobright.statewalk.v2.admission.QuotaKeys;
-import com.telcobright.statewalk.v2.admission.QuotaLimits;
-import com.telcobright.statewalk.v2.admission.RejectCause;
+import com.telcobright.statewalk.v2.registry.api.DispatchResult;
+import com.telcobright.statewalk.v2.registry.internal.QuotaController;
+import com.telcobright.statewalk.v2.registry.api.QuotaKeys;
+import com.telcobright.statewalk.v2.registry.api.QuotaLimits;
+import com.telcobright.statewalk.v2.registry.api.RejectCause;
 import com.telcobright.statewalk.v2.channel.Channel;
-import com.telcobright.statewalk.v2.event.EventTypeRegistry;
-import com.telcobright.statewalk.v2.event.StatemachineEvent;
+import com.telcobright.statewalk.v2.registry.consumes.EventTypeRegistry;
+import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 import com.telcobright.statewalk.v2.executor.BoundedVirtualThreadExecutor;
 import com.telcobright.statewalk.v2.machine.Machine;
 import com.telcobright.statewalk.v2.persistence.MachineSnapshot;

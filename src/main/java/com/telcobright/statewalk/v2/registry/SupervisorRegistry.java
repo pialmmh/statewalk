@@ -14,7 +14,7 @@ import java.util.List;
  *       registry's {@code dispatch}, keyed by the same request id.</li>
  *   <li>{@link #toChild(String, String, Object)} sends an inbound directive to
  *       a child machine — the child's registry routes it via
- *       {@link Registry#onInboundEvent(String, com.telcobright.statewalk.v2.event.StatemachineEvent)}.</li>
+ *       {@link Registry#onInboundEvent(String, com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent)}.</li>
  *   <li>On parent termination, every child registry is asked to force-cleanup
  *       its own machine for the same id, BEFORE the parent's pool return.
  *       Child-before-parent ordering is mechanical, not policy.</li>
@@ -49,7 +49,7 @@ public abstract class SupervisorRegistry<M extends Machine<?, C>, C> extends Reg
      * Send a directive event to a named child's machine.
      */
     public final void toChild(String requestId, String childName,
-                              com.telcobright.statewalk.v2.event.StatemachineEvent directive) {
+                              com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent directive) {
         NamedChild c = findChild(childName);
         if (c == null) return;
         c.registry().onInboundEvent(requestId, directive);

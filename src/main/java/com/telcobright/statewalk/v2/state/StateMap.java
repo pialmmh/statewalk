@@ -1,6 +1,6 @@
 package com.telcobright.statewalk.v2.state;
 
-import com.telcobright.statewalk.v2.event.StatemachineEvent;
+import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;

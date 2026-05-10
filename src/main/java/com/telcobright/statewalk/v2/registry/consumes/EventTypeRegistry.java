@@ -1,4 +1,4 @@
-package com.telcobright.statewalk.v2.event;
+package com.telcobright.statewalk.v2.registry.consumes;
 
 import com.telcobright.statewalk.v2.pool.ObjectPoolManager;
 import com.telcobright.statewalk.v2.pool.Poolable;

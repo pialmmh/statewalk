@@ -1,7 +1,7 @@
 package com.telcobright.statewalk.v2;
 
 import com.telcobright.statewalk.v2.channel.TestChannel;
-import com.telcobright.statewalk.v2.event.StatemachineEvent;
+import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 import com.telcobright.statewalk.v2.machine.Machine;
 import com.telcobright.statewalk.v2.persistence.InMemoryPersistenceProvider;
 import com.telcobright.statewalk.v2.persistence.MachineSnapshot;

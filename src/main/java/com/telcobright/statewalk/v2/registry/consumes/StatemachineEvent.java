@@ -1,4 +1,4 @@
-package com.telcobright.statewalk.v2.event;
+package com.telcobright.statewalk.v2.registry.consumes;
 
 /**
  * Marker for anything that can be fired into a {@link com.telcobright.statewalk.v2.machine.Machine}.

@@ -1,4 +1,8 @@
-package com.telcobright.statewalk.v2.admission;
+package com.telcobright.statewalk.v2.registry.internal;
+
+import com.telcobright.statewalk.v2.registry.api.QuotaKeys;
+import com.telcobright.statewalk.v2.registry.api.QuotaLimits;
+import com.telcobright.statewalk.v2.registry.api.RejectCause;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;

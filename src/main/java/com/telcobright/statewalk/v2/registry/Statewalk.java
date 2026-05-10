@@ -1,8 +1,8 @@
 package com.telcobright.statewalk.v2.registry;
 
 import com.telcobright.statewalk.v2.channel.Channel;
-import com.telcobright.statewalk.v2.event.EventTypeRegistry;
-import com.telcobright.statewalk.v2.event.StatemachineEvent;
+import com.telcobright.statewalk.v2.registry.consumes.EventTypeRegistry;
+import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 import com.telcobright.statewalk.v2.persistence.PersistenceProvider;
 import com.telcobright.statewalk.v2.persistence.SnapshotSerializer;
 import com.telcobright.statewalk.v2.pool.Poolable;

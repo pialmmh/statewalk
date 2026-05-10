@@ -1,11 +1,11 @@
 package com.telcobright.statewalk.v2;
 
-import com.telcobright.statewalk.v2.admission.DispatchResult;
-import com.telcobright.statewalk.v2.admission.QuotaKeys;
-import com.telcobright.statewalk.v2.admission.QuotaLimits;
-import com.telcobright.statewalk.v2.admission.RejectCause;
+import com.telcobright.statewalk.v2.registry.api.DispatchResult;
+import com.telcobright.statewalk.v2.registry.api.QuotaKeys;
+import com.telcobright.statewalk.v2.registry.api.QuotaLimits;
+import com.telcobright.statewalk.v2.registry.api.RejectCause;
 import com.telcobright.statewalk.v2.channel.TestChannel;
-import com.telcobright.statewalk.v2.event.StatemachineEvent;
+import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 import com.telcobright.statewalk.v2.machine.Machine;
 import com.telcobright.statewalk.v2.registry.Registry;
 import com.telcobright.statewalk.v2.registry.Statewalk;

@@ -1,4 +1,4 @@
-package com.telcobright.statewalk.v2.admission;
+package com.telcobright.statewalk.v2.registry.api;
 
 /**
  * Reason a registry rejected a dispatch attempt. The handler (e.g. CCH for

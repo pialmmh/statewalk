@@ -1,4 +1,4 @@
-package com.telcobright.statewalk.v2.admission;
+package com.telcobright.statewalk.v2.registry.api;
 
 /**
  * Keys identifying a request for quota-tracking purposes. Subclass registries

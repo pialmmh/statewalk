@@ -1,4 +1,4 @@
-package com.telcobright.statewalk.v2.event;
+package com.telcobright.statewalk.v2.registry.consumes;
 
 /**
  * Fired into a machine when a state's declared timeout matures.

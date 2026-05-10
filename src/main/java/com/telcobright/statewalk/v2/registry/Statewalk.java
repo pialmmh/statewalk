@@ -4,6 +4,7 @@ import com.telcobright.statewalk.v2.channel.Channel;
 import com.telcobright.statewalk.v2.event.EventTypeRegistry;
 import com.telcobright.statewalk.v2.event.StatemachineEvent;
 import com.telcobright.statewalk.v2.persistence.PersistenceProvider;
+import com.telcobright.statewalk.v2.persistence.SnapshotSerializer;
 import com.telcobright.statewalk.v2.pool.Poolable;
 import com.telcobright.statewalk.v2.state.StateConfig;
 
@@ -97,6 +98,22 @@ public final class Statewalk {
          */
         public Builder rehydrate(boolean enabled) {
             this.rehydrateEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Pre-warm the snapshot-serializer's class cache for the given
+         * context class. Eliminates the one-time {@code Class.forName} call
+         * the framework would otherwise perform on the first rehydrate
+         * after process restart for snapshots of this type.
+         *
+         * <p>Optional: the cache auto-warms on every successful save, so in
+         * steady state the cache is always populated. This method matters
+         * only when a process restarts with prior snapshots in the store
+         * that haven't been written by the current process yet.
+         */
+        public Builder preWarmContextClass(Class<?> contextClass) {
+            SnapshotSerializer.registerContextClass(contextClass);
             return this;
         }
 

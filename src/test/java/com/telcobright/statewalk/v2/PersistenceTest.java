@@ -284,6 +284,42 @@ class PersistenceTest {
     }
 
     @Test
+    void snapshot_class_cache_auto_warms_on_save() throws InterruptedException {
+        // Clear cache so we can observe the warm-up cleanly.
+        com.telcobright.statewalk.v2.persistence.SnapshotSerializer.clearClassCache();
+        int sizeBefore = com.telcobright.statewalk.v2.persistence.SnapshotSerializer.classCacheSize();
+        assertEquals(0, sizeBefore);
+
+        var sys = buildSystem(false);
+        try {
+            sys.dispatch("call", "warm-1", new CallTask("+880x"));
+            sys.awaitIdle(AWAIT);
+            // First save populated the cache as a side effect.
+            assertTrue(com.telcobright.statewalk.v2.persistence.SnapshotSerializer.classCacheSize() >= 1,
+                "save must auto-warm the class cache");
+        } finally {
+            sys.shutdown();
+        }
+    }
+
+    @Test
+    void prewarm_context_class_populates_cache() {
+        com.telcobright.statewalk.v2.persistence.SnapshotSerializer.clearClassCache();
+        Statewalk.builder()
+            .registerEvent(StartCall.class)
+            .registerEvent(Answered.class)
+            .registerEvent(Hangup.class)
+            .preWarmContextClass(CallContext.class)
+            .persistence(provider)
+            .registry("call", callReg, 8, 2)
+            .channel("call", channel)
+            .build()
+            .shutdown();
+        assertTrue(com.telcobright.statewalk.v2.persistence.SnapshotSerializer.classCacheSize() >= 1,
+            "preWarmContextClass must populate the cache before any save runs");
+    }
+
+    @Test
     void isFirst_event_creates_a_new_machine() throws InterruptedException {
         var sys = buildSystem(true);
         try {

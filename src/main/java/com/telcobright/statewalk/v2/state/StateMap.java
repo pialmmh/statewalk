@@ -147,6 +147,18 @@ public final class StateMap {
                 }
             }
 
+            // Mandatory state kind: every user-declared state must explicitly
+            // call either .interim() or .finalState() on the builder. No
+            // implicit default — forces every state author to state intent.
+            for (StateBuilder sb : stateBuilders.values()) {
+                if (!sb.kindDeclared) {
+                    throw new IllegalStateException(
+                        "State '" + sb.name + "' is missing a mandatory kind declaration. "
+                        + "Call either .interim() or .finalState() on every state. "
+                        + ".offline() is an additional flag on interim states only.");
+                }
+            }
+
             Map<String, StateConfig> built = new LinkedHashMap<>();
 
             // Auto-inject IDLE (no actions, no transitions, not final, not offline).
@@ -202,6 +214,8 @@ public final class StateMap {
             private String timeoutTarget;
             private boolean finalState;
             private boolean offline;
+            /** True once .interim() or .finalState() has been called. Builder rejects the state otherwise. */
+            private boolean kindDeclared;
 
             StateBuilder(String name, Builder parent) {
                 this.name = name;
@@ -236,8 +250,27 @@ public final class StateMap {
                 return this;
             }
 
+            /**
+             * Declare this state as <strong>final</strong> — entering it
+             * terminates the machine. Mutually exclusive with
+             * {@link #interim()} and {@link #offline()}.
+             */
             public StateBuilder finalState() {
                 this.finalState = true;
+                this.kindDeclared = true;
+                return this;
+            }
+
+            /**
+             * Declare this state as <strong>interim</strong> — a normal
+             * mid-flow state. Mandatory if not calling {@link #finalState()};
+             * forces every state author to state intent explicitly.
+             *
+             * <p>An interim state may additionally be marked {@link #offline()}
+             * for suspend semantics.
+             */
+            public StateBuilder interim() {
+                this.kindDeclared = true;
                 return this;
             }
 

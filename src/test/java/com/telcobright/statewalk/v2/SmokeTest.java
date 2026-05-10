@@ -54,6 +54,7 @@ class SmokeTest {
             return StateMap.builder()
                 .initialState("ACTIVE")
                 .state("ACTIVE")
+                    .interim()
                     .timeout(60, TimeUnit.SECONDS, "CLOSED")
                     .stay(Hello.class, (self, e) -> {
                         DemoMachine m = (DemoMachine) self;
@@ -195,6 +196,7 @@ class SmokeTest {
             StateMap.builder()
                 .initialState("X")
                 .state("X")
+                    .interim()
                     .on(Hello.class, "Y")
                 .state("Y")
                     .timeout(1, TimeUnit.SECONDS, "X")
@@ -311,6 +313,7 @@ class SmokeTest {
             StateMap.builder()
                 .initialState("A")
                 .state("A")
+                    .interim()
                     .timeout(1, TimeUnit.SECONDS, "Z")
                     .on(Hello.class, "Z")
                 .state("Z")
@@ -329,6 +332,7 @@ class SmokeTest {
                 return StateMap.builder()
                     .initialState("WAIT")
                     .state("WAIT")
+                        .interim()
                         .timeout(1, TimeUnit.SECONDS, "DONE")
                         .offline()
                         .on(Hello.class, "DONE")
@@ -354,6 +358,21 @@ class SmokeTest {
                 .build());
         assertTrue(ex.getMessage().contains("offline"));
         assertTrue(ex.getMessage().contains("persistence"));
+    }
+
+    @Test
+    void state_without_kind_declaration_is_rejected_at_build_time() {
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+            StateMap.builder()
+                .initialState("X")
+                .state("X")                          // <- no .interim() / .finalState()
+                    .timeout(1, TimeUnit.SECONDS, "Y")
+                    .on(Hello.class, "Y")
+                .state("Y")
+                    .finalState()
+                    .timeout(1, TimeUnit.SECONDS, "Y")
+                .build());
+        assertTrue(ex.getMessage().contains("missing a mandatory kind declaration"));
     }
 
     @Test

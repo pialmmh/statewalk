@@ -41,6 +41,7 @@ class QuotaTest {
             return StateMap.builder()
                 .initialState("ACTIVE")
                 .state("ACTIVE")
+                    .interim()
                     .timeout(60, TimeUnit.SECONDS, "DONE")
                     .on(GoOffline.class, "DONE")
                 .state("DONE")

@@ -65,6 +65,7 @@ class PersistenceTest {
             return StateMap.builder()
                 .initialState("RINGING")
                 .state("RINGING")
+                    .interim()
                     .onEntry(self -> {
                         entryActionRuns.incrementAndGet();
                         CallMachine m = (CallMachine) self;
@@ -77,6 +78,7 @@ class PersistenceTest {
                     .on(Answered.class, "ANSWERED")
                     .on(Hangup.class, "FAILED")
                 .state("ANSWERED")
+                    .interim()
                     .onEntry(self -> {
                         entryActionRuns.incrementAndGet();
                         ((CallMachine) self).getContext().answerCount++;
@@ -320,9 +322,11 @@ class PersistenceTest {
             StateMap.builder()
                 .initialState("X")
                 .state("X")
+                    .interim()
                     .timeout(1, TimeUnit.SECONDS, "Y")    // Y is not final
                     .on(Answered.class, "Y")
                 .state("Y")
+                    .interim()
                     .timeout(1, TimeUnit.SECONDS, "Z")
                 .state("Z")
                     .finalState()

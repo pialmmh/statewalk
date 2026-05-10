@@ -1,0 +1,455 @@
+package com.telcobright.statewalk.v2.machine;
+
+import com.telcobright.statewalk.v2.event.StatemachineEvent;
+import com.telcobright.statewalk.v2.event.TimeoutEvent;
+import com.telcobright.statewalk.v2.pool.Poolable;
+import com.telcobright.statewalk.v2.state.StateConfig;
+import com.telcobright.statewalk.v2.state.StateMap;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.ScheduledFuture;
+import java.util.function.BiConsumer;
+
+/**
+ * Base class for every state machine in the framework.
+ *
+ * <p><b>Mechanism vs policy.</b> The framework owns the mechanism: pool reset,
+ * IDLE invariant, lifecycle ordering, registry-required execution. Subclasses
+ * own the policy: what states exist, what entry/exit actions run, what
+ * transitions fire on what events. Policy is supplied as data via
+ * {@link #defineStates()} (see {@link StateMap}).
+ *
+ * <p><b>What is final, and why.</b>
+ * <ul>
+ *   <li>{@link #start()}, {@link #fire(StatemachineEvent)}, {@link #transitionTo(String)},
+ *       {@link #resetForReuse()}: the lifecycle skeleton. Subclass cannot
+ *       override or reorder these without breaking the IDLE invariant or
+ *       leaking captured references.</li>
+ *   <li>{@link #setRegistry(MachineRegistryHandle)}, {@link #setMachineId(String)}:
+ *       package-private. Only a registry can attach a machine to itself.</li>
+ * </ul>
+ *
+ * <p><b>What subclasses must provide.</b>
+ * <ul>
+ *   <li>{@link #defineStates()} — declarative state graph (data, not code).</li>
+ *   <li>{@link #createContext()} — fresh context per machine instance.</li>
+ *   <li>Optional: override {@link #onResetSubclass()} to clear subclass-specific
+ *       fields beyond what IDLE-state reset already does.</li>
+ * </ul>
+ *
+ * <p><b>Refuses to run without a registry.</b> {@link #start()} throws if
+ * {@link #setRegistry(MachineRegistryHandle)} has not been called. Machines are
+ * not standalone — they only exist as registry-managed resources.
+ *
+ * @param <E> persisting entity type (the per-request task / payload)
+ * @param <C> volatile context type (machine-scoped, cleared on reset)
+ */
+public abstract class Machine<E, C> implements Poolable {
+
+    /**
+     * Framework logger inherited by every machine type. Subclasses should not
+     * declare their own logger for lifecycle / state-transition events — the
+     * base class emits everything required.
+     */
+    protected static final Logger LOG = LoggerFactory.getLogger(Machine.class);
+
+    /** Set lazily on first {@link #start()} so subclasses don't repay graph build cost per borrow. */
+    private StateMap stateMap;
+
+    /** Bound by the registry on borrow; cleared on reset. */
+    private MachineRegistryHandle registry;
+    private String machineId;
+    private E persistingEntity;
+    private C context;
+
+    /** "IDLE" until start; otherwise the current state's name. */
+    private volatile String currentState = StateMap.IDLE;
+    private volatile boolean started;
+    private volatile boolean terminated;
+
+    /** Tracked state-timeout future for the current state, if any. */
+    private ScheduledFuture<?> stateTimeoutFuture;
+
+    /**
+     * If true, this machine emits DEBUG-level state-transition traces (state +
+     * context + event tuple) on every {@link #fire(StatemachineEvent)} and
+     * {@link #transitionTo(String)}. Set by the registry at dispatch based on
+     * the registry's debug-sample rate; cleared on {@link #resetForReuse()}.
+     */
+    private volatile boolean debugMode;
+
+    // ─────────────────────────────────────────────────────────────────
+    // Subclass extension points
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Build the state graph for this machine type. Called once per machine
+     * instance, lazily on first start. Implementations should construct via
+     * {@link StateMap#builder()} and return the result of {@link StateMap.Builder#build()}.
+     *
+     * <p>The IDLE state is auto-injected — do not declare it.
+     */
+    protected abstract StateMap defineStates();
+
+    /**
+     * Allocate a fresh volatile context. Called once on construction (or when
+     * a pooled instance was reset and the context needs re-creation).
+     */
+    protected abstract C createContext();
+
+    /**
+     * Subclass hook for reset. Called from {@link #resetForReuse()} after
+     * the framework has cleared common fields. Override to null subclass-
+     * specific fields the framework can't see.
+     *
+     * <p>Default: no-op. Most subclasses won't need to override — they keep
+     * state in {@code C}, which gets re-created per borrow.
+     */
+    protected void onResetSubclass() {}
+
+    // ─────────────────────────────────────────────────────────────────
+    // Registry binding (package-private — only Registry can call)
+    // ─────────────────────────────────────────────────────────────────
+
+    /** @hidden */
+    public final void setRegistry(MachineRegistryHandle handle) {
+        this.registry = handle;
+    }
+
+    /** @hidden */
+    public final void setMachineId(String id) {
+        this.machineId = id;
+    }
+
+    /** @hidden */
+    public final void setPersistingEntity(E entity) {
+        this.persistingEntity = entity;
+    }
+
+    /** @hidden Set by the registry on dispatch — do not call from user code. */
+    public final void setDebugMode(boolean v) { this.debugMode = v; }
+    public final boolean isDebugMode() { return debugMode; }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Public read-only accessors
+    // ─────────────────────────────────────────────────────────────────
+
+    public final String getMachineId() { return machineId; }
+    public final E getPersistingEntity() { return persistingEntity; }
+    public final C getContext() { return context; }
+    public final String getCurrentState() { return currentState; }
+    public final boolean isStarted() { return started; }
+    public final boolean isTerminated() { return terminated; }
+    public final boolean isInState(String name) { return currentState.equals(name); }
+    public final boolean isIdle() { return StateMap.IDLE.equals(currentState); }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Lifecycle (final — skeleton not overridable)
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Start the machine. Validates the IDLE invariant, allocates context if
+     * needed, builds the state map (lazily), and transitions IDLE → initial state.
+     *
+     * @throws IllegalStateException if no registry is bound, or if not in IDLE.
+     */
+    public final synchronized void start() {
+        if (registry == null) {
+            throw new IllegalStateException(
+                "Machine cannot run without a registry. Use registry.dispatch(...) or spawnChild(...).");
+        }
+        if (started) {
+            throw new IllegalStateException("Machine already started: " + machineId);
+        }
+        if (!StateMap.IDLE.equals(currentState)) {
+            throw new IllegalStateException(
+                "Machine is not in IDLE at start (was " + currentState + ") — pool reset bug suspected");
+        }
+
+        if (stateMap == null) {
+            stateMap = defineStates();
+            if (!stateMap.has(StateMap.IDLE)) {
+                throw new IllegalStateException(
+                    "StateMap missing IDLE — should be auto-injected by StateMap.Builder");
+            }
+        }
+        if (context == null) {
+            context = createContext();
+        }
+
+        started = true;
+        terminated = false;
+        transitionTo(stateMap.initialState());
+    }
+
+    /**
+     * Fire an event into the machine. Routes through transition table or
+     * stay action of the current state. Silently ignored if the current
+     * state has no entry for the event class.
+     */
+    public final synchronized void fire(StatemachineEvent event) {
+        if (!started || terminated) return;
+        StateConfig cur = stateMap.get(currentState);
+
+        if (debugMode && LOG.isDebugEnabled()) {
+            LOG.debug("[{}] fire state={} event={} ctx={}",
+                machineId, currentState, event.getClass().getSimpleName(), context);
+        }
+
+        BiConsumer<Object, StatemachineEvent> stay = cur.stayActions().get(event.getClass());
+        if (stay != null) {
+            stay.accept(this, event);
+            if (debugMode && LOG.isDebugEnabled()) {
+                LOG.debug("[{}] stay state={} ctx={}", machineId, currentState, context);
+            }
+            return;
+        }
+        String target = cur.transitions().get(event.getClass());
+        if (target != null) {
+            transitionTo(target);
+        }
+        // else silently ignore (machine doesn't care about this event in this state)
+    }
+
+    /**
+     * Imperative transition. Called by the framework on start, by entry
+     * actions to chain transitions, and by event dispatch when a transition
+     * matches.
+     *
+     * <p>Order:
+     * <ol>
+     *   <li>Run current state's exit action.</li>
+     *   <li>Cancel current state's timeout (if any).</li>
+     *   <li>Set the new state.</li>
+     *   <li>Schedule new state's timeout (if any).</li>
+     *   <li>Run new state's entry action.</li>
+     *   <li>If the new state is final, signal the registry to terminate.</li>
+     * </ol>
+     */
+    public final synchronized void transitionTo(String target) {
+        if (terminated) return;
+
+        StateConfig cur = currentState != null ? stateMap.get(currentState) : null;
+
+        // 1. exit action
+        if (cur != null && cur.onExit() != null) {
+            try { cur.onExit().accept(this); } catch (RuntimeException ignored) {}
+        }
+
+        // 2. cancel any outstanding state timeout
+        if (stateTimeoutFuture != null) {
+            stateTimeoutFuture.cancel(false);
+            stateTimeoutFuture = null;
+        }
+
+        // 3. switch state
+        StateConfig next = stateMap.get(target);
+        String fromState = currentState;
+        currentState = next.name();
+
+        if (debugMode && LOG.isDebugEnabled()) {
+            LOG.debug("[{}] transition {} -> {} ctx={}",
+                machineId, fromState, currentState, context);
+        }
+
+        // 4. schedule new state's timeout
+        if (next.timeout() != null) {
+            StateConfig.Timeout to = next.timeout();
+            stateTimeoutFuture = registry.schedule(
+                machineId,
+                () -> {
+                    synchronized (this) {
+                        if (terminated || !currentState.equals(next.name())) return;
+                    }
+                    fire(new TimeoutEvent(next.name(), to.targetState()));
+                    synchronized (this) {
+                        if (currentState.equals(next.name())) {
+                            transitionTo(to.targetState());
+                        }
+                    }
+                },
+                to.duration(),
+                to.unit());
+        }
+
+        // 5. entry action
+        if (next.onEntry() != null) {
+            try { next.onEntry().accept(this); } catch (RuntimeException ignored) {}
+        }
+
+        // 5b. notify registry for persistence (no-op if persistence disabled)
+        long deadlineMs = next.timeout() != null
+            ? System.currentTimeMillis() + next.timeout().unit().toMillis(next.timeout().duration())
+            : 0L;
+        String timeoutTarget = next.timeout() != null ? next.timeout().targetState() : null;
+        registry.onStateTransitioned(machineId, next.name(), deadlineMs, timeoutTarget);
+
+        // 6. terminal? signal registry
+        if (next.finalState() && !terminated) {
+            terminated = true;
+            registry.onMachineReachedTerminal(machineId);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Rehydration (final — entered after a persistence load)
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Restore a machine to a previously-persisted state. Called by the
+     * registry after the snapshot has been loaded and the context
+     * deserialized.
+     *
+     * <p>The entry action of the saved state is <b>not</b> replayed —
+     * it already ran when the state was originally entered. Behaviour
+     * depends on whether the saved state's timeout has elapsed since
+     * persistence:
+     * <ul>
+     *   <li><b>Timeout already fired</b> (deadline passed): run the saved
+     *       state's exit action, then transition to the timeout target —
+     *       which by builder rules is a final state, so the machine
+     *       enters the target's entry action and immediately terminates.</li>
+     *   <li><b>Timeout still pending</b>: schedule the remaining portion
+     *       of the timeout, no transition.</li>
+     *   <li><b>No timeout</b>: just sit in the saved state waiting for
+     *       events.</li>
+     * </ul>
+     *
+     * @param savedStateName       the state the machine was in when persisted
+     * @param deserializedContext  rehydrated context object (may be null)
+     * @param timeoutTargetState   target of the saved state's timeout (null if none)
+     * @param timeoutDeadlineMs    wall-clock epoch millis when timeout matures
+     *                             (0 if no timeout active)
+     */
+    @SuppressWarnings("unchecked")
+    public final synchronized void rehydrate(String savedStateName,
+                                              Object deserializedContext,
+                                              String timeoutTargetState,
+                                              long timeoutDeadlineMs) {
+        if (registry == null) {
+            throw new IllegalStateException(
+                "Machine cannot rehydrate without a registry. Use registry rehydration path.");
+        }
+        if (started) {
+            throw new IllegalStateException("Machine already started: " + machineId);
+        }
+        if (!StateMap.IDLE.equals(currentState)) {
+            throw new IllegalStateException(
+                "Machine is not in IDLE at rehydrate (was " + currentState + ")");
+        }
+
+        if (stateMap == null) stateMap = defineStates();
+        if (!stateMap.has(savedStateName)) {
+            throw new IllegalStateException(
+                "Saved state '" + savedStateName + "' not found in machine's state graph");
+        }
+
+        this.context = (C) deserializedContext;
+        this.started = true;
+        this.terminated = false;
+        this.currentState = savedStateName;
+
+        StateConfig saved = stateMap.get(savedStateName);
+        long now = System.currentTimeMillis();
+        boolean timeoutFired = timeoutDeadlineMs > 0 && now >= timeoutDeadlineMs;
+
+        if (timeoutFired && timeoutTargetState != null) {
+            // The timeout matured during downtime. transitionTo will run
+            // saved's onExit and then the target final state's onEntry +
+            // termination. Per spec: rehydration must NOT replay saved's
+            // onEntry (already done before persistence) — we don't, because
+            // we set currentState directly above without invoking transitionTo.
+            transitionTo(timeoutTargetState);
+            return;
+        }
+
+        // Schedule remaining timeout (if any).
+        if (saved.timeout() != null && timeoutDeadlineMs > 0) {
+            long remainingMs = Math.max(0, timeoutDeadlineMs - now);
+            StateConfig.Timeout to = saved.timeout();
+            stateTimeoutFuture = registry.schedule(
+                machineId,
+                () -> {
+                    synchronized (this) {
+                        if (terminated || !currentState.equals(savedStateName)) return;
+                    }
+                    fire(new TimeoutEvent(savedStateName, to.targetState()));
+                    synchronized (this) {
+                        if (currentState.equals(savedStateName)) {
+                            transitionTo(to.targetState());
+                        }
+                    }
+                },
+                remainingMs,
+                java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+
+        if (debugMode && LOG.isDebugEnabled()) {
+            LOG.debug("[{}] rehydrated to state={} ctx={}", machineId, currentState, context);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Pool reset (final — common reset; subclass extends via onResetSubclass)
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Pool reset. Called by the registry after the termination ritual, before
+     * returning the machine to its pool. After this returns, the machine is
+     * indistinguishable from a freshly allocated instance and is in IDLE.
+     */
+    @Override
+    public final synchronized void resetForReuse() {
+        if (stateTimeoutFuture != null) {
+            stateTimeoutFuture.cancel(false);
+            stateTimeoutFuture = null;
+        }
+
+        // Subclass-specific reset first (so it can read state if needed).
+        try { onResetSubclass(); } catch (RuntimeException ignored) {}
+
+        registry = null;
+        machineId = null;
+        persistingEntity = null;
+        context = null;
+        started = false;
+        terminated = false;
+        debugMode = false;
+        currentState = StateMap.IDLE;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Registry handle (lightweight back-reference; framework-owned)
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Limited handle a {@link Machine} uses to talk back to its registry —
+     * scheduling timeouts, signalling terminal arrival, and notifying state
+     * transitions for persistence.
+     *
+     * <p>Public so registries in other packages can implement it; treat as
+     * framework-internal otherwise.
+     */
+    public interface MachineRegistryHandle {
+        ScheduledFuture<?> schedule(String machineId, Runnable r,
+                                    long delay, java.util.concurrent.TimeUnit unit);
+        void onMachineReachedTerminal(String machineId);
+
+        /**
+         * Called after every successful state transition (entry action ran
+         * cleanly). Registry uses this to persist a snapshot when a
+         * persistence provider is configured. No-op otherwise.
+         *
+         * @param newState           the state just entered
+         * @param timeoutDeadlineMs  wall-clock epoch millis when the state's
+         *                           timeout matures, or {@code 0} if no
+         *                           timeout active
+         * @param timeoutTargetState the timeout's target state, or {@code null}
+         *                           if no timeout active
+         */
+        default void onStateTransitioned(String machineId, String newState,
+                                         long timeoutDeadlineMs, String timeoutTargetState) {}
+    }
+}

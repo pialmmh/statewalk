@@ -3,7 +3,7 @@ package com.telcobright.statewalk.v2.persistence;
 /**
  * Persisted state of a single machine, keyed by {@link #machineId}.
  *
- * <p>Written by the {@link com.telcobright.statewalk.v2.registry.Registry} after
+ * <p>Written by the {@link com.telcobright.statewalk.v2.registry.api.Registry} after
  * every state transition (when a {@link PersistenceProvider} is configured),
  * and read on rehydration when an inbound event arrives for an unknown id.
  *

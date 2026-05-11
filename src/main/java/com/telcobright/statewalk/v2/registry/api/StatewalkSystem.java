@@ -1,4 +1,4 @@
-package com.telcobright.statewalk.v2.registry;
+package com.telcobright.statewalk.v2.registry.api;
 
 import com.telcobright.statewalk.v2.registry.consumes.EventTypeRegistry;
 

@@ -3,9 +3,9 @@ package com.telcobright.statewalk.v2;
 import com.telcobright.statewalk.v2.channel.TestChannel;
 import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 import com.telcobright.statewalk.v2.machine.Machine;
-import com.telcobright.statewalk.v2.registry.Registry;
-import com.telcobright.statewalk.v2.registry.Statewalk;
-import com.telcobright.statewalk.v2.registry.StatewalkSystem;
+import com.telcobright.statewalk.v2.registry.api.Registry;
+import com.telcobright.statewalk.v2.registry.api.Statewalk;
+import com.telcobright.statewalk.v2.registry.api.StatewalkSystem;
 import com.telcobright.statewalk.v2.state.StateMap;
 
 import org.junit.jupiter.api.AfterEach;

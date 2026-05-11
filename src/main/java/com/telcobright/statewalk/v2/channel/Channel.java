@@ -3,7 +3,7 @@ package com.telcobright.statewalk.v2.channel;
 import java.util.function.BiConsumer;
 
 /**
- * Protocol I/O conduit between a {@link com.telcobright.statewalk.v2.registry.Registry}
+ * Protocol I/O conduit between a {@link com.telcobright.statewalk.v2.registry.api.Registry}
  * and an external system (FreeSWITCH ESL, sigtran, HTTP, Kafka, ...).
  *
  * <p><b>Send/receive symmetry.</b> A Channel exposes both directions:

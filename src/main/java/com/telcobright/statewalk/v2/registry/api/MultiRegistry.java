@@ -1,10 +1,8 @@
 package com.telcobright.statewalk.v2.registry.api;
 
-import com.telcobright.statewalk.v2.executor.BoundedVirtualThreadExecutor;
 import com.telcobright.statewalk.v2.machine.Machine;
-import com.telcobright.statewalk.v2.pool.ObjectPoolManager;
+import com.telcobright.statewalk.v2.registry.consumes.EventTypeRegistry;
 import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
-import com.telcobright.statewalk.v2.timeout.TimeoutManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,86 +10,56 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * Registry that hosts multiple machine TYPES under one roof, all keyed by the
- * same request id. Replacement for the parent/child {@code SupervisorRegistry}
- * pattern: machines for one request id are siblings (a flat group) sharing
- * the id, communicating via {@link InternalEventResolver} routing.
+ * Composes multiple {@link Registry} instances (one per machine type) under a
+ * single domain. All per-machine lifecycle — pooling, IDLE invariant, per-id
+ * FIFO chains, the 8-step termination ritual, persistence, quota, global
+ * timeout — is reused from the base {@code Registry} class. MultiRegistry adds
+ * only two things on top:
  *
- * <p>Data structure:
- * <pre>
- *   active = { requestId → { machineType → machine instance } }
- *   pools  = { machineType → ObjectPool of idle instances }
- *   chains = { "requestId:machineType" → CompletableFuture FIFO chain }
- * </pre>
+ * <ol>
+ *   <li><b>Cross-type event routing</b> via {@link InternalEventResolver}.
+ *       Each event class maps to (targetMachineType, idExtractor); the
+ *       resolver hands the event to the right inner Registry.</li>
+ *   <li><b>Cascade cleanup on primary terminate.</b> One machine type may be
+ *       marked primary; when its instance reaches a final state, every
+ *       sibling instance for the same id is force-cleaned.</li>
+ * </ol>
  *
- * <p>Communication:
- * <ul>
- *   <li>External wire events arrive via {@link #onInboundEvent}.</li>
- *   <li>Internal events between sibling machines flow through {@link #publish}.</li>
- *   <li>Both go through the resolver → land on a specific cell via {@link #fireOn}.</li>
- * </ul>
- *
- * <p>Cascade cleanup: one machine type may be marked {@code primary}. When the
- * primary cell terminates, the registry force-cleans every other cell for the
- * same id and removes the row.
+ * <p>Lifecycle code does NOT live here. If a memory leak shows up in voice,
+ * fixing it in {@link Registry} immediately benefits SMS, HTTP, USSD — every
+ * MultiRegistry-backed domain. That was the design goal.
  */
 public final class MultiRegistry {
 
     private static final Logger LOG = LoggerFactory.getLogger(MultiRegistry.class);
 
     private final String name;
-    private final Map<Class<? extends Machine<?, ?>>, TypeConfig> types;
-    private final Map<Class<? extends Machine<?, ?>>, ObjectPoolManager<? extends Machine<?, ?>>> pools;
+    private final Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children;
     private final Class<? extends Machine<?, ?>> primaryType;
     private final InternalEventResolver resolver;
-    private final BoundedVirtualThreadExecutor work;
-    private final TimeoutManager timeouts;
-
-    private final ConcurrentHashMap<String, MachineSet> active = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, CompletableFuture<Void>> chains = new ConcurrentHashMap<>();
-    private final Set<String> terminated = ConcurrentHashMap.newKeySet();
-
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
 
-    MultiRegistry(String name,
-                  Map<Class<? extends Machine<?, ?>>, TypeConfig> types,
-                  Class<? extends Machine<?, ?>> primaryType,
-                  InternalEventResolver resolver,
-                  int threads) {
+    /** Per-id set of currently-spawned machine types. Maintained on spawn + child terminate. */
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<Class<? extends Machine<?, ?>>>>
+        activeCells = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private MultiRegistry(String name,
+                          Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children,
+                          Class<? extends Machine<?, ?>> primaryType,
+                          InternalEventResolver resolver) {
         this.name = name;
-        this.types = Map.copyOf(types);
+        this.children = children;
         this.primaryType = primaryType;
         this.resolver = resolver;
-        this.timeouts = new TimeoutManager(name, Math.max(2, threads));
-        this.work = new BoundedVirtualThreadExecutor(name, Math.max(16, types.size() * 100));
-
-        this.pools = new ConcurrentHashMap<>();
-        types.forEach((cls, cfg) -> pools.put(cls, makePool(cls, cfg)));
-
-        LOG.info("[{}] initialized types={} primary={} rules={}",
-            name, types.keySet(), primaryType == null ? "none" : primaryType.getSimpleName(),
+        LOG.info("[{}] composed over {} inner registries (primary={}, routes={})",
+            name, children.keySet(), primaryType == null ? "none" : primaryType.getSimpleName(),
             resolver.size());
-    }
-
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private ObjectPoolManager<? extends Machine<?, ?>> makePool(
-            Class<? extends Machine<?, ?>> cls, TypeConfig cfg) {
-        return new ObjectPoolManager(
-            name + "-" + cls.getSimpleName(),
-            (Supplier) cfg.factory(),
-            cfg.poolSize());
     }
 
     public static Builder builder(String name) { return new Builder(name); }
@@ -99,66 +67,108 @@ public final class MultiRegistry {
     public String getName() { return name; }
 
     // ─────────────────────────────────────────────────────────────────
-    // Public API
+    // Public API — three primitives, all delegate to inner Registries
     // ─────────────────────────────────────────────────────────────────
 
     /** Borrow a machine of {@code type} for {@code id} and start it. */
-    @SuppressWarnings({"unchecked", "rawtypes"})
     public void spawn(String id, Class<? extends Machine<?, ?>> type, Object task) {
         if (shuttingDown.get()) return;
-        TypeConfig cfg = types.get(type);
-        if (cfg == null) {
-            throw new IllegalArgumentException("Unknown machine type: " + type.getName());
-        }
-        ObjectPoolManager pool = (ObjectPoolManager) pools.get(type);
-
-        Machine m = (Machine) pool.borrow();
-        if (!m.isIdle()) {
-            pool.returnObject(m);
-            m = (Machine) pool.borrow();
-            if (!m.isIdle()) {
-                LOG.error("[{}] pool integrity error for type {} — dropping spawn id={}",
-                    name, type.getSimpleName(), id);
-                return;
-            }
-        }
-
-        m.setRegistry(new CellHandle(this, id, type));
-        m.setMachineId(id);
-        if (cfg.volatileLoader() != null) m.setVolatileContextLoader(cfg.volatileLoader());
-        ((Machine) m).setPersistingEntity(task);
-
-        final Machine machine = m;
-        active.compute(id, (k, set) -> {
-            if (set == null) set = new MachineSet();
-            set.byType.put(type, machine);
+        Registry<?, ?> r = children.get(type);
+        if (r == null) throw new IllegalArgumentException("Unknown machine type: " + type.getName());
+        activeCells.compute(id, (k, set) -> {
+            if (set == null) set = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            set.add(type);
             return set;
         });
-        chainSubmit(cellKey(id, type), () -> {
-            try {
-                machine.start();
-            } catch (Throwable t) {
-                LOG.error("[{}] start threw for {}:{}: {} — force-cleaning",
-                    name, id, type.getSimpleName(), t.toString());
-                forceCleanup(id, type);
-            }
-        });
-        LOG.debug("[{}] spawn id={} type={}", name, id, type.getSimpleName());
+        r.dispatch(id, task);
     }
 
-    /** External entry: an inbound event from a channel. Resolver routes. */
+    /** External entry: wire event arrives, resolver routes to an inner Registry. */
     public void onInboundEvent(String id, StatemachineEvent event) {
         if (shuttingDown.get()) return;
-        routeAndFire(event);
+        routeAndFire(event, id);
     }
 
-    /** Internal entry: a state action publishes an event. Resolver routes. */
+    /** Internal entry: a machine state action publishes an event. */
     public void publish(StatemachineEvent event) {
         if (shuttingDown.get()) return;
-        routeAndFire(event);
+        routeAndFire(event, null);
     }
 
-    private void routeAndFire(StatemachineEvent event) {
+    /** Force-cleanup one cell. */
+    public void forceCleanup(String id, Class<? extends Machine<?, ?>> type) {
+        Registry<?, ?> r = children.get(type);
+        if (r != null) r.forceCleanupMachine(id);
+    }
+
+    /** Force-cleanup every machine for an id (cascade). */
+    public void forceCleanupAll(String id) {
+        for (var r : children.values()) {
+            try { r.forceCleanupMachine(id); } catch (RuntimeException ignored) {}
+        }
+    }
+
+    public void shutdown() {
+        if (!shuttingDown.compareAndSet(false, true)) return;
+        for (Registry<?, ?> r : children.values()) {
+            try { r.shutdown(); } catch (RuntimeException ignored) {}
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Observation
+    // ─────────────────────────────────────────────────────────────────
+
+    public Machine<?, ?> findMachine(String id, Class<? extends Machine<?, ?>> type) {
+        Registry<?, ?> r = children.get(type);
+        return r == null ? null : r.getMachine(id);
+    }
+
+    public boolean hasAny(String id) {
+        for (var r : children.values()) if (r.getMachine(id) != null) return true;
+        return false;
+    }
+
+    public int activeCellCount() {
+        int total = 0;
+        for (var r : children.values()) total += r.getActiveCount();
+        return total;
+    }
+
+    /** Number of distinct request ids with at least one active machine. */
+    public int activeIdCount() { return activeCells.size(); }
+
+    public boolean awaitIdle(long timeout, TimeUnit unit) throws InterruptedException {
+        long deadlineNs = System.nanoTime() + unit.toNanos(timeout);
+        // Cross-registry ping-pong (one machine's publish feeds another's chain)
+        // means a single pass through children can leave new work pending.
+        // Loop until two consecutive passes both find every child idle and
+        // the overall row count stable.
+        int prevCellCount = -1;
+        int stableCount = 0;
+        for (int pass = 0; pass < 20; pass++) {
+            for (var r : children.values()) {
+                long remainingNs = Math.max(0, deadlineNs - System.nanoTime());
+                if (remainingNs == 0) return false;
+                if (!r.awaitIdle(remainingNs, TimeUnit.NANOSECONDS)) return false;
+            }
+            int cells = activeCellCount();
+            if (cells == prevCellCount) {
+                stableCount++;
+                if (stableCount >= 2) return true;
+            } else {
+                stableCount = 0;
+                prevCellCount = cells;
+            }
+        }
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Internals
+    // ─────────────────────────────────────────────────────────────────
+
+    private void routeAndFire(StatemachineEvent event, String idHint) {
         InternalEventResolver.Rule<?> rule = resolver.lookup(event.getClass());
         if (rule == null) {
             LOG.warn("[{}] unrouted event {} dropped", name, event.getClass().getSimpleName());
@@ -168,206 +178,86 @@ public final class MultiRegistry {
         Function fn = rule.idExtractor();
         @SuppressWarnings("unchecked")
         String targetId = (String) fn.apply(event);
+        if (targetId == null) targetId = idHint;
         if (targetId == null) {
             LOG.warn("[{}] event {} extractor returned null id", name, event.getClass().getSimpleName());
             return;
         }
-        fireOn(targetId, rule.targetType(), event);
+        Registry<?, ?> r = children.get(rule.targetType());
+        if (r == null) {
+            LOG.warn("[{}] no inner registry for target type {}", name, rule.targetType());
+            return;
+        }
+        // Drop on unknown id — inner Registry would otherwise throw because
+        // its rehydration path is off here (we own the lifecycle decisions).
+        if (r.getMachine(targetId) == null) {
+            LOG.debug("[{}] no {} for id={} — event {} dropped",
+                name, rule.targetType().getSimpleName(), targetId,
+                event.getClass().getSimpleName());
+            return;
+        }
+        r.onInboundEvent(targetId, event);
     }
 
-    /** Fire an event on a specific cell. Used by the resolver after lookup. */
-    public void fireOn(String id, Class<? extends Machine<?, ?>> type, StatemachineEvent event) {
-        MachineSet set = active.get(id);
-        if (set == null) {
-            LOG.debug("[{}] fireOn no row for id={} (event {})",
-                name, id, event.getClass().getSimpleName());
-            return;
-        }
-        Machine<?, ?> m = set.byType.get(type);
-        if (m == null) {
-            LOG.debug("[{}] fireOn no {} for id={} (event {})",
-                name, type.getSimpleName(), id, event.getClass().getSimpleName());
-            return;
-        }
-        if (m.isTerminated()) return;
-
-        final Machine<?, ?> machine = m;
-        chainSubmit(cellKey(id, type), () -> {
-            try {
-                machine.fire(event);
-            } catch (Throwable t) {
-                LOG.warn("[{}] fire threw for {}:{}: {}",
-                    name, id, type.getSimpleName(), t.toString());
-            }
+    /** Called from every inner Registry's handleTermination override. */
+    private void onChildTerminated(String id, Class<? extends Machine<?, ?>> type) {
+        // Track this cell as gone; remove the id from activeCells once empty.
+        activeCells.computeIfPresent(id, (k, set) -> {
+            set.remove(type);
+            return set.isEmpty() ? null : set;
         });
-    }
-
-    /** Force-cleanup one cell. */
-    public void forceCleanup(String id, Class<? extends Machine<?, ?>> type) {
-        onCellTerminated(id, type);
-    }
-
-    /** Force-cleanup every machine for an id (cascade). */
-    public void forceCleanupAll(String id) {
-        MachineSet set = active.get(id);
-        if (set == null) return;
-        for (var entry : new ArrayList<>(set.byType.entrySet())) {
-            forceCleanup(id, entry.getKey());
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // Termination ritual (per cell)
-    // ─────────────────────────────────────────────────────────────────
-
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    void onCellTerminated(String id, Class<? extends Machine<?, ?>> type) {
-        String key = cellKey(id, type);
-        if (!terminated.add(key)) return;  // dedup
-
-        MachineSet set = active.get(id);
-        if (set == null) { terminated.remove(key); return; }
-        Machine m = set.byType.remove(type);
-        if (m == null) { terminated.remove(key); return; }
-
-        try { m.resetForReuse(); }
-        catch (RuntimeException e) {
-            LOG.warn("[{}] reset threw for {}: {}", name, key, e.toString());
-        }
-        if (m.isIdle()) {
-            ObjectPoolManager pool = (ObjectPoolManager) pools.get(type);
-            pool.returnObject(m);
-        }
-        chains.remove(key);
-        LOG.debug("[{}] cell terminated key={}", name, key);
-
-        // Cascade if this was the primary type for this id.
+        // Cascade: if the primary just terminated, force-clean every sibling.
         if (primaryType != null && primaryType.equals(type)) {
-            for (var sibling : new ArrayList<>(set.byType.entrySet())) {
-                forceCleanup(id, sibling.getKey());
+            for (var e : children.entrySet()) {
+                if (e.getKey().equals(type)) continue;
+                try { e.getValue().forceCleanupMachine(id); } catch (RuntimeException ignored) {}
             }
         }
-
-        if (set.byType.isEmpty()) active.remove(id);
-
-        // Dedup TTL eviction
-        timeouts.schedule(() -> terminated.remove(key), 60, TimeUnit.SECONDS);
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Chain submission (per-cell FIFO)
+    // Per-type inner Registry — anonymous subclass with overrides
     // ─────────────────────────────────────────────────────────────────
-
-    private void chainSubmit(String chainKey, Runnable task) {
-        chains.compute(chainKey, (k, prev) -> {
-            CompletableFuture<Void> base = (prev == null)
-                ? CompletableFuture.completedFuture(null) : prev;
-            return base.thenRunAsync(() -> {
-                try { task.run(); }
-                catch (Throwable t) {
-                    LOG.warn("[{}] chain task threw for {}: {}", name, chainKey, t.toString());
-                }
-            }, work.asExecutor());
-        });
-    }
-
-    private static String cellKey(String id, Class<? extends Machine<?, ?>> type) {
-        return id + ":" + type.getSimpleName();
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // Test / observation helpers
-    // ─────────────────────────────────────────────────────────────────
-
-    public boolean awaitIdle(long timeout, TimeUnit unit) throws InterruptedException {
-        long deadlineNs = System.nanoTime() + unit.toNanos(timeout);
-        for (var f : new ArrayList<>(chains.values())) {
-            long remainingNs = Math.max(0, deadlineNs - System.nanoTime());
-            try { f.get(remainingNs, TimeUnit.NANOSECONDS); }
-            catch (ExecutionException e) { /* logged in chainSubmit */ }
-            catch (TimeoutException e) { return false; }
-        }
-        long remainingNs = Math.max(0, deadlineNs - System.nanoTime());
-        return work.awaitIdle(remainingNs, TimeUnit.NANOSECONDS);
-    }
-
-    public int activeIdCount() { return active.size(); }
-
-    public int activeCellCount() {
-        int total = 0;
-        for (var set : active.values()) total += set.byType.size();
-        return total;
-    }
-
-    public Machine<?, ?> findMachine(String id, Class<? extends Machine<?, ?>> type) {
-        MachineSet set = active.get(id);
-        return set == null ? null : set.byType.get(type);
-    }
-
-    public boolean hasAny(String id) { return active.containsKey(id); }
-
-    // ─────────────────────────────────────────────────────────────────
-    // Shutdown
-    // ─────────────────────────────────────────────────────────────────
-
-    public void shutdown() {
-        if (!shuttingDown.compareAndSet(false, true)) return;
-        for (String id : new ArrayList<>(active.keySet())) {
-            try { forceCleanupAll(id); } catch (RuntimeException ignored) {}
-        }
-        try { work.awaitIdle(5, TimeUnit.SECONDS); }
-        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        work.close();
-        timeouts.shutdown();
-        pools.values().forEach(ObjectPoolManager::clear);
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // Inner types
-    // ─────────────────────────────────────────────────────────────────
-
-    record TypeConfig(
-        Supplier<? extends Machine<?, ?>> factory,
-        int poolSize,
-        Function<Machine<?, ?>, Object> volatileLoader
-    ) {}
-
-    static class MachineSet {
-        final ConcurrentHashMap<Class<? extends Machine<?, ?>>, Machine<?, ?>> byType =
-            new ConcurrentHashMap<>();
-    }
 
     /**
-     * Per-cell handle. Each Machine instance is wired with one of these on
-     * borrow; it carries the id + type so callbacks know which cell is
-     * speaking without the Machine class itself needing to know.
+     * Builds one inner {@link Registry} for the given machine type. The inner
+     * registry IS the proven lifecycle; we only override:
+     * <ul>
+     *   <li>{@link Registry#handleTermination} — to notify MultiRegistry for cascade.</li>
+     *   <li>{@link Machine.MachineRegistryHandle#publish} — so a machine's
+     *       {@code publishEvent} call goes up through us to the resolver.</li>
+     * </ul>
      */
-    static final class CellHandle implements Machine.MachineRegistryHandle {
-        private final MultiRegistry registry;
-        private final String id;
-        private final Class<? extends Machine<?, ?>> type;
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static <M extends Machine<?, ?>> Registry<M, ?> buildInnerRegistry(
+            String parentName,
+            Class<M> machineType,
+            Supplier<M> factory,
+            int maxConcurrent,
+            long globalTimeoutMs,
+            String globalTimeoutTargetState,
+            MultiRegistry parent) {
 
-        CellHandle(MultiRegistry registry, String id, Class<? extends Machine<?, ?>> type) {
-            this.registry = registry;
-            this.id = id;
-            this.type = type;
-        }
+        Registry<M, ?> reg = new Registry() {
+            @Override protected String getRegistryName() {
+                return parentName + ":" + machineType.getSimpleName();
+            }
+            @Override protected int getMaxConcurrent() { return maxConcurrent; }
+            @Override protected long getGlobalTimeoutMs() { return globalTimeoutMs; }
+            @Override protected String getGlobalTimeoutTargetState() { return globalTimeoutTargetState; }
+            @Override protected Machine createMachineTemplate() { return factory.get(); }
 
-        @Override
-        public ScheduledFuture<?> schedule(String machineId, Runnable r,
-                                            long delay, TimeUnit unit) {
-            return registry.timeouts.schedule(r, delay, unit);
-        }
+            @Override
+            protected void handleTermination(String requestId, Machine machine, String finalState) {
+                parent.onChildTerminated(requestId, machineType);
+            }
 
-        @Override
-        public void onMachineReachedTerminal(String machineId) {
-            registry.onCellTerminated(id, type);
-        }
-
-        @Override
-        public void publish(StatemachineEvent event) {
-            registry.publish(event);
-        }
+            @Override
+            public void publish(StatemachineEvent event) {
+                parent.publish(event);
+            }
+        };
+        return reg;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -375,34 +265,46 @@ public final class MultiRegistry {
     // ─────────────────────────────────────────────────────────────────
 
     public static final class Builder {
+
+        private record TypeSpec(
+            Supplier<? extends Machine<?, ?>> factory,
+            int maxConcurrent,
+            int poolSize,
+            int timeoutThreads,
+            Function<Machine<?, ?>, Object> volatileLoader,
+            long globalTimeoutMs,
+            String globalTimeoutTargetState
+        ) {}
+
         private final String name;
-        private final Map<Class<? extends Machine<?, ?>>, TypeConfig> types = new LinkedHashMap<>();
+        private final EventTypeRegistry eventTypes = new EventTypeRegistry();
         private final InternalEventResolver resolver = new InternalEventResolver();
+        private final Map<Class<? extends Machine<?, ?>>, TypeSpec> typeSpecs = new LinkedHashMap<>();
         private Class<? extends Machine<?, ?>> primaryType;
-        private int threads = 2;
 
         Builder(String name) { this.name = name; }
 
         public <M extends Machine<?, ?>> Builder machine(
                 Class<M> type, Supplier<M> factory, int poolSize) {
-            return machine(type, factory, poolSize, null);
+            return machine(type, factory, poolSize, poolSize, 2, null, 0L, null);
         }
 
-        @SuppressWarnings({"unchecked", "rawtypes"})
         public <M extends Machine<?, ?>> Builder machine(
-                Class<M> type, Supplier<M> factory, int poolSize,
-                Function<Machine<?, ?>, Object> volatileLoader) {
-            if (types.containsKey(type)) {
+                Class<M> type, Supplier<M> factory, int poolSize, int maxConcurrent,
+                int timeoutThreads,
+                Function<Machine<?, ?>, Object> volatileLoader,
+                long globalTimeoutMs, String globalTimeoutTargetState) {
+            if (typeSpecs.containsKey(type)) {
                 throw new IllegalStateException("Duplicate machine type: " + type.getName());
             }
-            types.put(type, new TypeConfig((Supplier) factory, poolSize, volatileLoader));
+            typeSpecs.put(type, new TypeSpec(factory, maxConcurrent, poolSize, timeoutThreads,
+                volatileLoader, globalTimeoutMs, globalTimeoutTargetState));
             return this;
         }
 
         public Builder primary(Class<? extends Machine<?, ?>> type) {
-            if (!types.containsKey(type)) {
-                throw new IllegalStateException(
-                    "Primary type not registered: " + type.getName());
+            if (!typeSpecs.containsKey(type)) {
+                throw new IllegalStateException("Primary type not registered: " + type.getName());
             }
             this.primaryType = type;
             return this;
@@ -412,21 +314,41 @@ public final class MultiRegistry {
                 Class<E> eventClass,
                 Class<? extends Machine<?, ?>> targetType,
                 Function<E, String> idExtractor) {
-            if (!types.containsKey(targetType)) {
-                throw new IllegalStateException(
-                    "Route target type not registered: " + targetType.getName());
+            if (!typeSpecs.containsKey(targetType)) {
+                throw new IllegalStateException("Route target type not registered: " + targetType.getName());
             }
             resolver.register(eventClass, targetType, idExtractor);
+            eventTypes.register(eventClass);
             return this;
         }
 
-        public Builder threads(int n) { this.threads = n; return this; }
-
         public MultiRegistry build() {
-            if (types.isEmpty()) {
+            if (typeSpecs.isEmpty()) {
                 throw new IllegalStateException("No machine types registered");
             }
-            return new MultiRegistry(name, types, primaryType, resolver, threads);
+            Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children = new LinkedHashMap<>();
+            // Build the MultiRegistry first (so inner registries can refer back).
+            // Two-phase: create object, then populate children + initialize.
+            MultiRegistry mr = new MultiRegistry(name, children, primaryType, resolver);
+            for (var entry : typeSpecs.entrySet()) {
+                var type = entry.getKey();
+                var spec = entry.getValue();
+                @SuppressWarnings({"unchecked", "rawtypes"})
+                Registry<?, ?> reg = buildInnerRegistry(
+                    name, (Class) type, (Supplier) spec.factory(),
+                    spec.maxConcurrent(),
+                    spec.globalTimeoutMs(), spec.globalTimeoutTargetState(),
+                    mr);
+                children.put(type, reg);
+                // Reuse Registry's full initialize() — same pool, chain, persistence,
+                // timeout, quota infrastructure that voice already uses.
+                reg.initialize(eventTypes, spec.poolSize(), spec.timeoutThreads(),
+                    /* debugSampleRate */ 0,
+                    /* persistence */    null, false,
+                    /* timeout override */ 0L, null,
+                    spec.volatileLoader());
+            }
+            return mr;
         }
     }
 }

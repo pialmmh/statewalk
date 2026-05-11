@@ -253,6 +253,21 @@ public abstract class Machine<E, C> implements Poolable {
     }
 
     /**
+     * Emit an internal event that the registry's resolver routes to the right
+     * sibling machine in the same domain. Used by state actions in a
+     * MultiRegistry — e.g. CallSignalingMachine.Terminated.entry publishes
+     * {@code SignalingTerminated(uuid, cause)} so the CallSupervisor for the
+     * same uuid receives it.
+     */
+    public final void publishEvent(com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent event) {
+        if (registry == null) {
+            throw new IllegalStateException(
+                "Cannot publish — machine has no registry handle (call before start or after reset).");
+        }
+        registry.publish(event);
+    }
+
+    /**
      * Fire an event into the machine. Routes through transition table or
      * stay action of the current state. Silently ignored if the current
      * state has no entry for the event class.
@@ -518,6 +533,18 @@ public abstract class Machine<E, C> implements Poolable {
         ScheduledFuture<?> schedule(String machineId, Runnable r,
                                     long delay, java.util.concurrent.TimeUnit unit);
         void onMachineReachedTerminal(String machineId);
+
+        /**
+         * Publish an internal event for the registry's resolver to route.
+         * Used by multi-machine registries where machine instances in the
+         * same domain communicate via typed events; the resolver maps the
+         * event class to a target machine type + id. Default throws — only
+         * multi-machine registries implement it.
+         */
+        default void publish(com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent event) {
+            throw new UnsupportedOperationException(
+                "publish() is supported only by MultiRegistry-managed machines.");
+        }
 
         /**
          * Called after every successful state transition (entry action ran

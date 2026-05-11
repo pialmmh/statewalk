@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.ScheduledFuture;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 /**
  * Base class for every state machine in the framework.
@@ -63,6 +64,24 @@ public abstract class Machine<E, C> implements Poolable {
     private String machineId;
     private E persistingEntity;
     private C context;
+
+    /**
+     * Truly volatile context — never persisted to snapshots. Holds config
+     * params, transient service handles (resolvers, clients), per-tenant
+     * overlays — anything that must be re-attached after rehydration rather
+     * than carried inside the snapshot. Populated by {@link #volatileLoader}
+     * on both creation and rehydration; cleared on {@link #resetForReuse()}.
+     */
+    private Object volatileContext;
+
+    /**
+     * Caller-supplied loader registered through
+     * {@code Statewalk.builder().volatileLoader(...)} and propagated by the
+     * registry at borrow time. Invoked from {@link #start()} and
+     * {@link #rehydrate} after the persistent {@code context} is in place
+     * but before any state action runs.
+     */
+    private Function<Machine<?, ?>, Object> volatileLoader;
 
     /** "IDLE" until start; otherwise the current state's name. */
     private volatile String currentState = StateMap.IDLE;
@@ -132,6 +151,14 @@ public abstract class Machine<E, C> implements Poolable {
     public final void setDebugMode(boolean v) { this.debugMode = v; }
     public final boolean isDebugMode() { return debugMode; }
 
+    /**
+     * @hidden Set by the registry on borrow (dispatch + rehydrate) before the
+     * machine starts. The same callback fires on both creation and rehydration.
+     */
+    public final void setVolatileContextLoader(Function<Machine<?, ?>, Object> loader) {
+        this.volatileLoader = loader;
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Public read-only accessors
     // ─────────────────────────────────────────────────────────────────
@@ -190,10 +217,39 @@ public abstract class Machine<E, C> implements Poolable {
         if (context == null) {
             context = createContext();
         }
+        populateVolatileContext();
 
         started = true;
         terminated = false;
         transitionTo(stateMap.initialState());
+    }
+
+    /**
+     * Run the registered loader against this machine and stash the result.
+     * Same callback fires on both creation and rehydration, so state action
+     * code reads {@link #getVolatileContext()} the same way in either path.
+     * Loader exceptions are logged and swallowed — a missing volatile
+     * context surfaces at the call site, not as a poisoned machine.
+     */
+    private void populateVolatileContext() {
+        Function<Machine<?, ?>, Object> ldr = this.volatileLoader;
+        if (ldr == null) return;
+        try {
+            this.volatileContext = ldr.apply(this);
+        } catch (RuntimeException e) {
+            LOG.warn("[{}] volatile-context loader threw: {} — volatileContext left null",
+                machineId, e.toString());
+            this.volatileContext = null;
+        }
+    }
+
+    /**
+     * Subclasses (and state actions) read this to get at config / service
+     * handles attached by the loader. Returns {@code null} if no loader was
+     * registered for this machine's registry.
+     */
+    public final Object getVolatileContext() {
+        return volatileContext;
     }
 
     /**
@@ -370,6 +426,7 @@ public abstract class Machine<E, C> implements Poolable {
         }
 
         this.context = (C) deserializedContext;
+        populateVolatileContext();
         this.started = true;
         this.terminated = false;
         this.currentState = savedStateName;
@@ -437,6 +494,8 @@ public abstract class Machine<E, C> implements Poolable {
         machineId = null;
         persistingEntity = null;
         context = null;
+        volatileContext = null;
+        volatileLoader = null;
         started = false;
         terminated = false;
         debugMode = false;

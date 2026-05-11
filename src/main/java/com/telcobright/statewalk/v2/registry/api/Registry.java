@@ -248,6 +248,14 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     /** Effective global timeout (ms). Builder override of {@link #getGlobalTimeoutMs()}. */
     private volatile long effectiveGlobalTimeoutMs;
 
+    /**
+     * Caller-supplied loader for the machine's volatile (non-persisted)
+     * context. Set once at {@link #initialize}; propagated to every machine
+     * at dispatch and at rehydration. {@code null} means no volatile context
+     * is loaded — machines see {@code null} from {@code getVolatileContext()}.
+     */
+    private volatile java.util.function.Function<Machine<?, ?>, Object> volatileContextLoader;
+
     // ─────────────────────────────────────────────────────────────────
     // Initialisation — package-private; only Statewalk.Builder may call.
     // ─────────────────────────────────────────────────────────────────
@@ -264,7 +272,8 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
     final void initialize(EventTypeRegistry eventTypes, int poolSize, int timeoutThreads,
                           int debugSampleRate,
                           PersistenceProvider persistenceProvider, boolean rehydrateEnabled,
-                          long globalTimeoutMsOverride, String globalTimeoutTargetStateOverride) {
+                          long globalTimeoutMsOverride, String globalTimeoutTargetStateOverride,
+                          java.util.function.Function<Machine<?, ?>, Object> volatileContextLoader) {
         validateInit(poolSize, timeoutThreads);
         if (initialized) {
             throw new IllegalStateException(getRegistryName() + " already initialized");
@@ -273,6 +282,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
         this.debugSampleRate = Math.max(0, debugSampleRate);
         this.persistenceProvider = persistenceProvider;
         this.rehydrateEnabled = rehydrateEnabled;
+        this.volatileContextLoader = volatileContextLoader;
         this.effectiveGlobalTimeoutMs = globalTimeoutMsOverride > 0
             ? globalTimeoutMsOverride : getGlobalTimeoutMs();
         this.effectiveGlobalTimeoutTargetState = globalTimeoutTargetStateOverride != null
@@ -402,6 +412,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
 
         machine.setRegistry(this);
         machine.setMachineId(requestId);
+        machine.setVolatileContextLoader(volatileContextLoader);
         @SuppressWarnings("unchecked")
         Machine<Object, C> typed = (Machine<Object, C>) machine;
         typed.setPersistingEntity(task);
@@ -561,6 +572,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
         }
         machine.setRegistry(this);
         machine.setMachineId(requestId);
+        machine.setVolatileContextLoader(volatileContextLoader);
 
         Object ctx = SnapshotSerializer.contextFromBase64Json(
             snap.contextJsonBase64(), snap.contextClassName());

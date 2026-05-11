@@ -70,6 +70,8 @@ public final class Statewalk {
         private final Map<String, RegistryEntry> registries = new LinkedHashMap<>();
         private final List<ChannelBinding> channelBindings = new ArrayList<>();
         private final Map<String, GlobalTimeoutOverride> globalTimeoutOverrides = new LinkedHashMap<>();
+        private final Map<String, java.util.function.Function<com.telcobright.statewalk.v2.machine.Machine<?, ?>, Object>>
+            volatileContextLoaders = new LinkedHashMap<>();
         private PersistenceProvider persistenceProvider;
         private boolean rehydrateEnabled;
 
@@ -202,6 +204,34 @@ public final class Statewalk {
         }
 
         /**
+         * Register a loader that produces the <em>volatile</em> (non-persisted)
+         * context for every machine of the named registry. The framework
+         * invokes the same loader on both creation (via {@code dispatch}) and
+         * rehydration — so state-action code reads
+         * {@link com.telcobright.statewalk.v2.machine.Machine#getVolatileContext()}
+         * the same way on either path.
+         *
+         * <p>Use this for config snapshots, partner / route resolver handles,
+         * DB clients, cache references — anything that must be re-attached
+         * after rehydration rather than carried inside the snapshot.
+         *
+         * <p>Returning {@code null} from the loader is permitted; throwing is
+         * logged and treated as null. The loader runs once per
+         * borrow / rehydration, before any state action.
+         *
+         * @param registryName name of the registry the loader applies to
+         * @param loader       receives the machine instance, returns the
+         *                     volatile context object (caller-cast on use)
+         */
+        public Builder volatileLoader(String registryName,
+                java.util.function.Function<com.telcobright.statewalk.v2.machine.Machine<?, ?>, Object> loader) {
+            if (registryName == null) throw new IllegalArgumentException("registryName required");
+            if (loader == null) throw new IllegalArgumentException("loader required");
+            volatileContextLoaders.put(registryName, loader);
+            return this;
+        }
+
+        /**
          * Validate, initialise every registered registry, wire channels, and
          * return the runtime handle.
          *
@@ -224,10 +254,11 @@ public final class Statewalk {
                 GlobalTimeoutOverride override = globalTimeoutOverrides.get(entry.name);
                 long timeoutMs = override != null ? override.durationMs : 0L;
                 String target  = override != null ? override.targetState : null;
+                var volLoader = volatileContextLoaders.get(entry.name);
                 entry.registry.initialize(
                     eventTypes, entry.poolSize, entry.timeoutThreads, entry.debugSampleRate,
                     persistenceProvider, rehydrateEnabled,
-                    timeoutMs, target);
+                    timeoutMs, target, volLoader);
             }
 
             // Bind channels and wire inbound.

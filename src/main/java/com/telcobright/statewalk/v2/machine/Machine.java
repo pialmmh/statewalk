@@ -137,6 +137,13 @@ public abstract class Machine<E, C> implements Poolable {
         this.registry = handle;
     }
 
+    /** Framework-internal: returns the handle bound by the registry. Used by
+     * {@code Supervisor} to reach its owning flat Registry; typical user code
+     * has no reason to call this. */
+    public final MachineRegistryHandle getRegistry() {
+        return this.registry;
+    }
+
     /** @hidden */
     public final void setMachineId(String id) {
         this.machineId = id;

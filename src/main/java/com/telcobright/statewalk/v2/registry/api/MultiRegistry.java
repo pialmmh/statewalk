@@ -1,6 +1,7 @@
 package com.telcobright.statewalk.v2.registry.api;
 
 import com.telcobright.statewalk.v2.machine.Machine;
+import com.telcobright.statewalk.v2.persistence.PersistenceProvider;
 import com.telcobright.statewalk.v2.registry.consumes.EventTypeRegistry;
 import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 
@@ -43,6 +44,8 @@ public final class MultiRegistry {
     private final Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children;
     private final Class<? extends Machine<?, ?>> primaryType;
     private final InternalEventResolver resolver;
+    private final PersistenceProvider persistence;
+    private final boolean rehydrateEnabled;
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
 
     /** Per-id set of currently-spawned machine types. Maintained on spawn + child terminate. */
@@ -52,14 +55,18 @@ public final class MultiRegistry {
     private MultiRegistry(String name,
                           Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children,
                           Class<? extends Machine<?, ?>> primaryType,
-                          InternalEventResolver resolver) {
+                          InternalEventResolver resolver,
+                          PersistenceProvider persistence,
+                          boolean rehydrateEnabled) {
         this.name = name;
         this.children = children;
         this.primaryType = primaryType;
         this.resolver = resolver;
-        LOG.info("[{}] composed over {} inner registries (primary={}, routes={})",
+        this.persistence = persistence;
+        this.rehydrateEnabled = rehydrateEnabled;
+        LOG.info("[{}] composed over {} inner registries (primary={}, routes={}, persistence={}, rehydrate={})",
             name, children.keySet(), primaryType == null ? "none" : primaryType.getSimpleName(),
-            resolver.size());
+            resolver.size(), persistence != null, rehydrateEnabled);
     }
 
     public static Builder builder(String name) { return new Builder(name); }
@@ -188,15 +195,65 @@ public final class MultiRegistry {
             LOG.warn("[{}] no inner registry for target type {}", name, rule.targetType());
             return;
         }
-        // Drop on unknown id — inner Registry would otherwise throw because
-        // its rehydration path is off here (we own the lifecycle decisions).
+        // Cross-cell rehydration: if the target cell is missing AND persistence
+        // is enabled, try to restore EVERY cell that has a saved snapshot for
+        // this id. We must restore siblings too, otherwise this event will run
+        // but later publishes (e.g. SignalingTerminated → CallSupervisor) will
+        // find no recipient and the call's state will silently leak.
         if (r.getMachine(targetId) == null) {
-            LOG.debug("[{}] no {} for id={} — event {} dropped",
-                name, rule.targetType().getSimpleName(), targetId,
-                event.getClass().getSimpleName());
-            return;
+            int restored = restoreAllCellsFor(targetId);
+            if (restored == 0) {
+                LOG.debug("[{}] no {} for id={} — event {} dropped",
+                    name, rule.targetType().getSimpleName(), targetId,
+                    event.getClass().getSimpleName());
+                return;
+            }
+            // re-check after rehydration attempt
+            if (r.getMachine(targetId) == null) {
+                LOG.debug("[{}] rehydrated {} cells for id={} but target {} not among them — event {} dropped",
+                    name, restored, targetId, rule.targetType().getSimpleName(),
+                    event.getClass().getSimpleName());
+                return;
+            }
         }
         r.onInboundEvent(targetId, event);
+    }
+
+    /**
+     * Restore every cell that has a persisted snapshot for {@code id}. Returns
+     * the number of cells restored. Called by {@link #routeAndFire} on the
+     * arrival of an event whose target cell is not in memory.
+     *
+     * <p>Restores ALL siblings, not just the target — partial-cell state
+     * after rehydration is a known footgun (the supervisor's TearingDown
+     * entry expects BalanceTracker to be alive, etc.).
+     */
+    private int restoreAllCellsFor(String id) {
+        if (persistence == null || !rehydrateEnabled) return 0;
+        int restored = 0;
+        for (Registry<?, ?> reg : children.values()) {
+            if (reg.getMachine(id) != null) continue;  // already alive
+            try {
+                if (reg.restoreFromPersistence(id)) {
+                    restored++;
+                    activeCells.compute(id, (k, set) -> {
+                        if (set == null) set = java.util.concurrent.ConcurrentHashMap.newKeySet();
+                        // Find the type whose Registry was just restored
+                        for (var e : children.entrySet()) {
+                            if (e.getValue() == reg) set.add(e.getKey());
+                        }
+                        return set;
+                    });
+                }
+            } catch (RuntimeException e) {
+                LOG.warn("[{}] cell restore failed for id={} in {}: {}",
+                    name, id, reg.getRegistryName(), e.toString());
+            }
+        }
+        if (restored > 0) {
+            LOG.info("[{}] cross-cell rehydration for id={} restored {} cells", name, id, restored);
+        }
+        return restored;
     }
 
     /** Called from every inner Registry's handleTermination override. */
@@ -281,8 +338,32 @@ public final class MultiRegistry {
         private final InternalEventResolver resolver = new InternalEventResolver();
         private final Map<Class<? extends Machine<?, ?>>, TypeSpec> typeSpecs = new LinkedHashMap<>();
         private Class<? extends Machine<?, ?>> primaryType;
+        private PersistenceProvider persistence;
+        private boolean rehydrateEnabled;
 
         Builder(String name) { this.name = name; }
+
+        /**
+         * Configure the snapshot provider. With persistence configured, every
+         * state transition of every cell is saved. Snapshots are keyed by
+         * (machineId, registryName) so multiple cells of one request id
+         * coexist independently.
+         */
+        public Builder persistence(PersistenceProvider provider) {
+            this.persistence = provider;
+            return this;
+        }
+
+        /**
+         * Enable cross-cell rehydration: on the first inbound event for an
+         * unknown id, every cell that has a saved snapshot for that id is
+         * restored together — not just the cell the event is targeted at.
+         * Requires {@link #persistence(PersistenceProvider)}.
+         */
+        public Builder rehydrate(boolean enabled) {
+            this.rehydrateEnabled = enabled;
+            return this;
+        }
 
         public <M extends Machine<?, ?>> Builder machine(
                 Class<M> type, Supplier<M> factory, int poolSize) {
@@ -326,10 +407,15 @@ public final class MultiRegistry {
             if (typeSpecs.isEmpty()) {
                 throw new IllegalStateException("No machine types registered");
             }
+            if (rehydrateEnabled && persistence == null) {
+                throw new IllegalStateException(
+                    "rehydrate(true) requires .persistence(...) on the MultiRegistry builder");
+            }
             Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children = new LinkedHashMap<>();
             // Build the MultiRegistry first (so inner registries can refer back).
             // Two-phase: create object, then populate children + initialize.
-            MultiRegistry mr = new MultiRegistry(name, children, primaryType, resolver);
+            MultiRegistry mr = new MultiRegistry(name, children, primaryType, resolver,
+                persistence, rehydrateEnabled);
             for (var entry : typeSpecs.entrySet()) {
                 var type = entry.getKey();
                 var spec = entry.getValue();
@@ -341,10 +427,12 @@ public final class MultiRegistry {
                     mr);
                 children.put(type, reg);
                 // Reuse Registry's full initialize() — same pool, chain, persistence,
-                // timeout, quota infrastructure that voice already uses.
+                // timeout, quota infrastructure that voice already uses. All inner
+                // Registries share the SAME persistence provider; snapshots are
+                // namespaced by registryName so they don't collide.
                 reg.initialize(eventTypes, spec.poolSize(), spec.timeoutThreads(),
                     /* debugSampleRate */ 0,
-                    /* persistence */    null, false,
+                    persistence, rehydrateEnabled,
                     /* timeout override */ 0L, null,
                     spec.volatileLoader());
             }

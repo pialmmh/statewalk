@@ -70,7 +70,7 @@ class JdbcPersistenceTest {
         provider.save(original);
         assertEquals(1, provider.size());
 
-        MachineSnapshot loaded = provider.load("id-1").orElseThrow();
+        MachineSnapshot loaded = provider.load("id-1", "demo-reg").orElseThrow();
         assertEquals(original.machineId(), loaded.machineId());
         assertEquals(original.registryName(), loaded.registryName());
         assertEquals(original.currentState(), loaded.currentState());
@@ -98,7 +98,7 @@ class JdbcPersistenceTest {
         provider.save(v2);
         assertEquals(1, provider.size(), "second save should UPDATE, not INSERT");
 
-        MachineSnapshot loaded = provider.load("id-2").orElseThrow();
+        MachineSnapshot loaded = provider.load("id-2", "r").orElseThrow();
         assertEquals("S2", loaded.currentState());
         assertEquals(150, loaded.savedAtMs());
     }
@@ -108,20 +108,20 @@ class JdbcPersistenceTest {
         provider.save(new MachineSnapshot("id-3", "r", "S", null, null, 0, "CLOSED", 0));
         assertEquals(1, provider.size());
 
-        provider.delete("id-3");
+        provider.delete("id-3", "r");
         assertEquals(0, provider.size());
-        assertTrue(provider.load("id-3").isEmpty());
+        assertTrue(provider.load("id-3", "r").isEmpty());
     }
 
     @Test
     void load_missing_returns_empty() {
-        assertTrue(provider.load("nope").isEmpty());
+        assertTrue(provider.load("nope", "r").isEmpty());
     }
 
     @Test
     void delete_missing_is_a_noop() {
         // No throw, no row count change.
-        provider.delete("never-existed");
+        provider.delete("never-existed", "r");
         assertEquals(0, provider.size());
     }
 

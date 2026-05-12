@@ -12,6 +12,8 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -21,6 +23,10 @@ import java.util.Optional;
  * Default table name is {@code statewalk_machine_snapshots}; override via
  * the two-arg constructor to support multi-tenant deployments where each
  * tenant's snapshots live in its own table.
+ *
+ * <p>Composite PK on {@code (machine_id, registry_name)} so the same logical
+ * request id can have multiple cells persisted (one per machine type in a
+ * multi-machine registry).
  *
  * <p>Upsert is implemented as portable UPDATE-then-INSERT inside a transaction
  * — works on every JDBC database without dialect-specific syntax.
@@ -48,14 +54,15 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
 
     private void ensureSchema() {
         String ddl = "CREATE TABLE IF NOT EXISTS " + table + " ("
-            + "machine_id           VARCHAR(255) PRIMARY KEY, "
+            + "machine_id           VARCHAR(255) NOT NULL, "
             + "registry_name        VARCHAR(255) NOT NULL, "
             + "current_state        VARCHAR(255) NOT NULL, "
             + "context_class        VARCHAR(512), "
             + "context_json_b64     TEXT, "
             + "saved_at_ms          BIGINT NOT NULL, "
             + "timeout_target_state VARCHAR(255), "
-            + "timeout_deadline_ms  BIGINT NOT NULL"
+            + "timeout_deadline_ms  BIGINT NOT NULL, "
+            + "PRIMARY KEY (machine_id, registry_name)"
             + ")";
         try (Connection c = dataSource.getConnection(); Statement s = c.createStatement()) {
             s.executeUpdate(ddl);
@@ -67,9 +74,9 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
     @Override
     public void save(MachineSnapshot snap) {
         String upd = "UPDATE " + table + " SET "
-            + "registry_name=?, current_state=?, context_class=?, context_json_b64=?, "
+            + "current_state=?, context_class=?, context_json_b64=?, "
             + "saved_at_ms=?, timeout_target_state=?, timeout_deadline_ms=? "
-            + "WHERE machine_id=?";
+            + "WHERE machine_id=? AND registry_name=?";
         String ins = "INSERT INTO " + table + " ("
             + "machine_id, registry_name, current_state, context_class, context_json_b64, "
             + "saved_at_ms, timeout_target_state, timeout_deadline_ms) "
@@ -98,19 +105,20 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
                 c.setAutoCommit(prevAuto);
             }
         } catch (SQLException e) {
-            throw new RuntimeException("save failed for " + snap.machineId() + ": " + e.getMessage(), e);
+            throw new RuntimeException("save failed for "
+                + snap.machineId() + "/" + snap.registryName() + ": " + e.getMessage(), e);
         }
     }
 
     private void bindUpdate(PreparedStatement ps, MachineSnapshot s) throws SQLException {
-        ps.setString(1, s.registryName());
-        ps.setString(2, s.currentState());
-        ps.setString(3, s.contextClassName());
-        ps.setString(4, s.contextJsonBase64());
-        ps.setLong  (5, s.savedAtMs());
-        ps.setString(6, s.timeoutTargetState());
-        ps.setLong  (7, s.timeoutDeadlineMs());
-        ps.setString(8, s.machineId());
+        ps.setString(1, s.currentState());
+        ps.setString(2, s.contextClassName());
+        ps.setString(3, s.contextJsonBase64());
+        ps.setLong  (4, s.savedAtMs());
+        ps.setString(5, s.timeoutTargetState());
+        ps.setLong  (6, s.timeoutDeadlineMs());
+        ps.setString(7, s.machineId());
+        ps.setString(8, s.registryName());
     }
 
     private void bindInsert(PreparedStatement ps, MachineSnapshot s) throws SQLException {
@@ -125,38 +133,70 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
     }
 
     @Override
-    public Optional<MachineSnapshot> load(String machineId) {
-        String sql = "SELECT registry_name, current_state, context_class, context_json_b64, "
+    public Optional<MachineSnapshot> load(String machineId, String registryName) {
+        String sql = "SELECT current_state, context_class, context_json_b64, "
             + "saved_at_ms, timeout_target_state, timeout_deadline_ms "
-            + "FROM " + table + " WHERE machine_id=?";
+            + "FROM " + table + " WHERE machine_id=? AND registry_name=?";
         try (Connection c = dataSource.getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, machineId);
+            ps.setString(2, registryName);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) return Optional.empty();
                 return Optional.of(new MachineSnapshot(
                     machineId,
+                    registryName,
                     rs.getString(1),
                     rs.getString(2),
                     rs.getString(3),
-                    rs.getString(4),
-                    rs.getLong  (5),
-                    rs.getString(6),
-                    rs.getLong  (7)));
+                    rs.getLong  (4),
+                    rs.getString(5),
+                    rs.getLong  (6)));
             }
         } catch (SQLException e) {
-            throw new RuntimeException("load failed for " + machineId + ": " + e.getMessage(), e);
+            throw new RuntimeException("load failed for "
+                + machineId + "/" + registryName + ": " + e.getMessage(), e);
         }
     }
 
     @Override
-    public void delete(String machineId) {
+    public List<MachineSnapshot> loadAll(String machineId) {
+        String sql = "SELECT registry_name, current_state, context_class, context_json_b64, "
+            + "saved_at_ms, timeout_target_state, timeout_deadline_ms "
+            + "FROM " + table + " WHERE machine_id=?";
+        List<MachineSnapshot> out = new ArrayList<>();
         try (Connection c = dataSource.getConnection();
-             PreparedStatement ps = c.prepareStatement("DELETE FROM " + table + " WHERE machine_id=?")) {
+             PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, machineId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new MachineSnapshot(
+                        machineId,
+                        rs.getString(1),
+                        rs.getString(2),
+                        rs.getString(3),
+                        rs.getString(4),
+                        rs.getLong  (5),
+                        rs.getString(6),
+                        rs.getLong  (7)));
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("loadAll failed for " + machineId + ": " + e.getMessage(), e);
+        }
+        return out;
+    }
+
+    @Override
+    public void delete(String machineId, String registryName) {
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement(
+                 "DELETE FROM " + table + " WHERE machine_id=? AND registry_name=?")) {
+            ps.setString(1, machineId);
+            ps.setString(2, registryName);
             ps.executeUpdate();
         } catch (SQLException e) {
-            LOG.warn("delete failed for {}: {}", machineId, e.toString());
+            LOG.warn("delete failed for {}/{}: {}", machineId, registryName, e.toString());
         }
     }
 

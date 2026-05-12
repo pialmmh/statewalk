@@ -559,7 +559,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
 
     @SuppressWarnings("unchecked")
     private M rehydrateMachine(String requestId) {
-        var snap = persistenceProvider.load(requestId).orElse(null);
+        var snap = persistenceProvider.load(requestId, getRegistryName()).orElse(null);
         if (snap == null) {
             LOG.debug("[{}] no snapshot for id={} — cannot rehydrate", getRegistryName(), requestId);
             return null;
@@ -598,6 +598,23 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
             getRegistryName(), requestId, snap.currentState(),
             snap.timeoutFiredBy(now));
         return machine;
+    }
+
+    /**
+     * Standalone rehydrate — restore a machine from its saved snapshot
+     * without an inbound event triggering it. Used by {@link MultiRegistry}
+     * to preload sibling cells when one cell receives an event and the
+     * rest need to come back into memory to participate in the call's
+     * lifecycle. Returns {@code true} if a machine was restored.
+     *
+     * <p>Package-private — only the framework calls this; user code goes
+     * through {@code onInboundEvent} which triggers rehydration as a side
+     * effect of the event arrival.
+     */
+    final boolean restoreFromPersistence(String requestId) {
+        if (persistenceProvider == null || !rehydrateEnabled) return false;
+        if (activeMachines.containsKey(requestId)) return false;
+        return rehydrateMachine(requestId) != null;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -786,7 +803,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
 
         // Persistence cleanup: terminated machines do not need rehydration.
         if (persistenceProvider != null) {
-            try { persistenceProvider.delete(requestId); }
+            try { persistenceProvider.delete(requestId, getRegistryName()); }
             catch (RuntimeException e) {
                 LOG.warn("[{}] persistence delete failed for id={}: {}",
                     getRegistryName(), requestId, e.toString());

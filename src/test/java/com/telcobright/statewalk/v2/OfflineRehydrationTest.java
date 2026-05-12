@@ -122,8 +122,8 @@ class OfflineRehydrationTest {
 
         assertEquals(1, suspendedEntryRuns.get(), "entry runs once on initial creation");
         assertNull(registry.getMachine(id), "offline machine is removed from active map");
-        assertTrue(persistence.load(id).isPresent(), "snapshot persisted while offline");
-        assertEquals("SUSPENDED", persistence.load(id).get().currentState());
+        assertTrue(persistence.load(id, "sessions").isPresent(), "snapshot persisted while offline");
+        assertEquals("SUSPENDED", persistence.load(id, "sessions").get().currentState());
 
         // Trigger rehydration by sending a Heartbeat that re-enters SUSPENDED.
         // (Self-transition: exit + entry would both run for a normal transition.
@@ -157,7 +157,7 @@ class OfflineRehydrationTest {
         assertEquals(1, closedEntryRuns.get(),    "terminal entry runs once on arrival");
         assertEquals(1, suspendedExitRuns.get(),  "exit fires on transition out of SUSPENDED");
         assertNull(registry.getMachine(id), "terminated machine cleared from active map");
-        assertFalse(persistence.load(id).isPresent(), "snapshot deleted on terminal");
+        assertFalse(persistence.load(id, "sessions").isPresent(), "snapshot deleted on terminal");
     }
 
     @Test
@@ -172,7 +172,7 @@ class OfflineRehydrationTest {
         // and transition straight to EXPIRED (final).
         assertEquals(1, suspendedEntryRuns.get());
         assertNull(registry.getMachine(id));
-        long deadline = persistence.load(id).get().timeoutDeadlineMs();
+        long deadline = persistence.load(id, "sessions").get().timeoutDeadlineMs();
         assertTrue(deadline > 0, "snapshot carries timeout deadline");
 
         Thread.sleep(600);
@@ -188,6 +188,6 @@ class OfflineRehydrationTest {
         assertEquals(1, suspendedExitRuns.get(),"SUSPENDED exit ran on transition to EXPIRED");
         assertEquals(1, suspendedEntryRuns.get(),"SUSPENDED entry NOT replayed during rehydrate");
         assertNull(registry.getMachine(id),     "machine terminated and reclaimed");
-        assertFalse(persistence.load(id).isPresent(), "snapshot deleted on terminal");
+        assertFalse(persistence.load(id, "sessions").isPresent(), "snapshot deleted on terminal");
     }
 }

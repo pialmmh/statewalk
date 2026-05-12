@@ -159,7 +159,7 @@ class PersistenceTest {
             sys.awaitIdle(AWAIT);
             // After dispatch: machine in RINGING. Snapshot saved.
             assertEquals(1, provider.size());
-            MachineSnapshot s1 = provider.load("c-1").orElseThrow();
+            MachineSnapshot s1 = provider.load("c-1", "call").orElseThrow();
             assertEquals("RINGING", s1.currentState());
             assertEquals("FAILED", s1.timeoutTargetState());
             assertNotNull(s1.contextJsonBase64());
@@ -167,7 +167,7 @@ class PersistenceTest {
             channel.inject("c-1", new Answered());
             sys.awaitIdle(AWAIT);
             // Now in ANSWERED. New snapshot saved.
-            MachineSnapshot s2 = provider.load("c-1").orElseThrow();
+            MachineSnapshot s2 = provider.load("c-1", "call").orElseThrow();
             assertEquals("ANSWERED", s2.currentState());
             assertTrue(s2.savedAtMs() >= s1.savedAtMs());
         } finally {
@@ -182,12 +182,12 @@ class PersistenceTest {
             sys.dispatch("call", "c-2", new CallTask("+880x"));
             channel.inject("c-2", new Answered());
             sys.awaitIdle(AWAIT);
-            assertTrue(provider.load("c-2").isPresent());
+            assertTrue(provider.load("c-2", "call").isPresent());
 
             channel.inject("c-2", new Hangup());
             sys.awaitIdle(AWAIT);
             // COMPLETED is final → ritual deletes the snapshot.
-            assertTrue(provider.load("c-2").isEmpty());
+            assertTrue(provider.load("c-2", "call").isEmpty());
         } finally {
             sys.shutdown();
         }
@@ -214,7 +214,7 @@ class PersistenceTest {
             sys.awaitIdle(AWAIT);
 
             assertNull(callReg.getMachine("c-3"));
-            assertTrue(provider.load("c-3").isEmpty());
+            assertTrue(provider.load("c-3", "call").isEmpty());
             assertEquals(1, entryActionRuns.get(),
                 "Only COMPLETED.onEntry should run; ANSWERED.onEntry must be skipped on rehydrate");
             assertEquals(1, exitActionRuns.get(),
@@ -244,7 +244,7 @@ class PersistenceTest {
             sys.awaitIdle(AWAIT);
 
             assertNull(callReg.getMachine("c-4"));
-            assertTrue(provider.load("c-4").isEmpty());
+            assertTrue(provider.load("c-4", "call").isEmpty());
             assertEquals(1, exitActionRuns.get(), "RINGING.onExit during fired-timeout transition");
             assertEquals(1, entryActionRuns.get(), "FAILED.onEntry on terminal arrival");
         } finally {
@@ -332,7 +332,7 @@ class PersistenceTest {
             assertEquals("RINGING", m.getCurrentState());
             assertEquals("+880abc", m.getContext().calledNumber);
             // Snapshot persisted on entering RINGING.
-            assertTrue(provider.load("c-7").isPresent());
+            assertTrue(provider.load("c-7", "call").isPresent());
         } finally {
             sys.shutdown();
         }

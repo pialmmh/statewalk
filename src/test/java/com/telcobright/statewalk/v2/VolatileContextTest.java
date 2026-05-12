@@ -151,14 +151,14 @@ class VolatileContextTest {
         assertEquals(2, loaderInvocations.get(),
             "loader must fire a second time on rehydration");
         assertNull(registry.getMachine("id-2"), "terminated after Close");
-        assertFalse(persistence.load("id-2").isPresent(), "snapshot deleted on terminal");
+        assertFalse(persistence.load("id-2", "vol").isPresent(), "snapshot deleted on terminal");
     }
 
     @Test
     void volatile_context_is_not_persisted() throws InterruptedException {
         channel.inject("id-3", new Hello("carol"));
         assertTrue(system.awaitIdle(Duration.ofSeconds(2)));
-        var snap = persistence.load("id-3").orElseThrow();
+        var snap = persistence.load("id-3", "vol").orElseThrow();
         // Snapshot's contextJsonBase64 holds only the persistent State,
         // not the Resources object. Easiest cross-check: ensure the
         // tenantTag string never appears in the encoded blob.

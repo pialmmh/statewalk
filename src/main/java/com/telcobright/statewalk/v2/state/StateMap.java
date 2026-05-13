@@ -106,10 +106,13 @@ public final class StateMap {
 
             // Validate all transition + timeout targets exist (IDLE is always valid).
             for (StateBuilder sb : stateBuilders.values()) {
-                for (String target : sb.transitions.values()) {
-                    if (!IDLE.equals(target) && !stateBuilders.containsKey(target)) {
-                        throw new IllegalStateException(
-                            "State '" + sb.name + "' transitions to unknown state '" + target + "'");
+                for (var optList : sb.transitions.values()) {
+                    for (var opt : optList) {
+                        String target = opt.targetState();
+                        if (!IDLE.equals(target) && !stateBuilders.containsKey(target)) {
+                            throw new IllegalStateException(
+                                "State '" + sb.name + "' transitions to unknown state '" + target + "'");
+                        }
                     }
                 }
                 if (!IDLE.equals(sb.timeoutTarget)
@@ -176,11 +179,17 @@ public final class StateMap {
                 StateConfig.Timeout to = sb.timeoutDuration > 0
                     ? new StateConfig.Timeout(sb.timeoutDuration, sb.timeoutUnit, sb.timeoutTarget)
                     : null;
+                // Freeze each guarded-transition list so runtime walking is safe.
+                java.util.Map<Class<? extends StatemachineEvent>, java.util.List<StateConfig.GuardedTransition>> frozenTransitions =
+                    new LinkedHashMap<>();
+                for (var e : sb.transitions.entrySet()) {
+                    frozenTransitions.put(e.getKey(), java.util.List.copyOf(e.getValue()));
+                }
                 built.put(sb.name, new StateConfig(
                     sb.name,
                     sb.onEntry,
                     sb.onExit,
-                    Collections.unmodifiableMap(new LinkedHashMap<>(sb.transitions)),
+                    Collections.unmodifiableMap(frozenTransitions),
                     Collections.unmodifiableMap(new LinkedHashMap<>(sb.stayActions)),
                     to,
                     sb.finalState,
@@ -207,7 +216,7 @@ public final class StateMap {
             private final Builder parent;
             private Consumer<Object> onEntry;
             private Consumer<Object> onExit;
-            private final Map<Class<? extends StatemachineEvent>, String> transitions = new LinkedHashMap<>();
+            private final Map<Class<? extends StatemachineEvent>, java.util.List<StateConfig.GuardedTransition>> transitions = new LinkedHashMap<>();
             private final Map<Class<? extends StatemachineEvent>, BiConsumer<Object, StatemachineEvent>> stayActions = new LinkedHashMap<>();
             private long timeoutDuration;
             private TimeUnit timeoutUnit;
@@ -232,8 +241,33 @@ public final class StateMap {
                 return this;
             }
 
+            /**
+             * Unconditional transition for {@code eventType} from this state.
+             * If this state already has guarded {@code on(...)} entries for the
+             * same event, this acts as the fallback — guards are evaluated in
+             * declaration order; the first one whose predicate returns true
+             * wins, and an unconditional entry counts as "always true".
+             */
             public StateBuilder on(Class<? extends StatemachineEvent> eventType, String targetState) {
-                transitions.put(eventType, targetState);
+                return on(eventType, targetState, null);
+            }
+
+            /**
+             * Guarded transition. The {@code guard} predicate receives the
+             * machine instance (as {@code Object}) and the firing event; if
+             * it returns true, the machine transitions to {@code targetState}.
+             *
+             * <p>Multiple guarded {@code on(...)} calls for the same event are
+             * legal — they are evaluated in declaration order, first match
+             * wins. Conventionally, declare guarded variants first and a
+             * final {@code on(eventType, fallback)} last as the catch-all.
+             */
+            public StateBuilder on(Class<? extends StatemachineEvent> eventType,
+                                    String targetState,
+                                    java.util.function.BiPredicate<Object, StatemachineEvent> guard) {
+                transitions
+                    .computeIfAbsent(eventType, k -> new java.util.ArrayList<>())
+                    .add(new StateConfig.GuardedTransition(guard, targetState));
                 return this;
             }
 

@@ -296,9 +296,34 @@ public abstract class Machine<E, C> implements Poolable {
             }
             return;
         }
-        String target = cur.transitions().get(event.getClass());
-        if (target != null) {
-            transitionTo(target);
+        // Walk guarded transition list in declaration order; first match wins.
+        // A null guard counts as "always true" (unconditional / fallback).
+        var options = cur.transitions().get(event.getClass());
+        if (options != null) {
+            for (var opt : options) {
+                var guard = opt.guard();
+                boolean passes;
+                if (guard == null) {
+                    passes = true;
+                } else {
+                    try { passes = guard.test(this, event); }
+                    catch (RuntimeException e) {
+                        if (debugMode && LOG.isDebugEnabled()) {
+                            LOG.debug("[{}] guard threw for event={} state={}: {} — treating as false",
+                                machineId, event.getClass().getSimpleName(), currentState, e.toString());
+                        }
+                        passes = false;
+                    }
+                }
+                if (passes) {
+                    transitionTo(opt.targetState());
+                    return;
+                }
+            }
+            if (debugMode && LOG.isDebugEnabled()) {
+                LOG.debug("[{}] event={} state={} — all guards rejected; staying",
+                    machineId, event.getClass().getSimpleName(), currentState);
+            }
         }
         // else silently ignore (machine doesn't care about this event in this state)
     }

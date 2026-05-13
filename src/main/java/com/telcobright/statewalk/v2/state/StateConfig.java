@@ -2,9 +2,11 @@ package com.telcobright.statewalk.v2.state;
 
 import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 
 /**
@@ -38,11 +40,23 @@ public record StateConfig(
     String name,
     Consumer<Object> onEntry,
     Consumer<Object> onExit,
-    Map<Class<? extends StatemachineEvent>, String> transitions,
+    Map<Class<? extends StatemachineEvent>, List<GuardedTransition>> transitions,
     Map<Class<? extends StatemachineEvent>, BiConsumer<Object, StatemachineEvent>> stayActions,
     Timeout timeout,
     boolean finalState,
     boolean offline
 ) {
     public record Timeout(long duration, TimeUnit unit, String targetState) {}
+
+    /**
+     * One transition option for an event class. A list of these is stored
+     * per event so a state can resolve the same event to different targets
+     * based on context (guard predicates evaluated in declaration order;
+     * first match wins). {@code guard == null} means unconditional —
+     * effectively an "always true" fallback.
+     */
+    public record GuardedTransition(
+        BiPredicate<Object, StatemachineEvent> guard,
+        String targetState
+    ) {}
 }

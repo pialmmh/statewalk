@@ -47,7 +47,7 @@ class VolatileContextTest {
     static final AtomicInteger entryWithResourcesPresent = new AtomicInteger(0);
     static final AtomicInteger entryWithResourcesNull    = new AtomicInteger(0);
 
-    static class M extends Machine<Task, State> {
+    static class M extends Machine<State> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -57,9 +57,6 @@ class VolatileContextTest {
                     .timeout(60, TimeUnit.SECONDS, "DONE")
                     .onEntry(self -> {
                         M m = (M) self;
-                        if (m.getPersistingEntity() != null) {
-                            m.getContext().userId = m.getPersistingEntity().userId();
-                        }
                         // Volatile context must be populated BEFORE entry runs.
                         if (m.getVolatileContext() != null) {
                             entryWithResourcesPresent.incrementAndGet();
@@ -84,7 +81,7 @@ class VolatileContextTest {
         @Override protected M createMachineTemplate()   { return new M(); }
         @Override
         protected Object createTaskFromFirstEvent(String requestId, StatemachineEvent firstEvent) {
-            if (firstEvent instanceof Hello h) return new Task(h.userId());
+            if (firstEvent instanceof Hello h) { State c = new State(); c.userId = h.userId(); return c; }
             return super.createTaskFromFirstEvent(requestId, firstEvent);
         }
     }

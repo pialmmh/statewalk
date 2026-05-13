@@ -36,7 +36,7 @@ class QuotaTest {
 
     public record GoOffline() implements StatemachineEvent {}
 
-    static class QMachine extends Machine<QTask, QCtx> {
+    static class QMachine extends Machine<QCtx> {
         @Override protected StateMap defineStates() {
             return StateMap.builder()
                 .initialState("ACTIVE")

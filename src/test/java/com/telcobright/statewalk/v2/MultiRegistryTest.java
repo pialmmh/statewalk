@@ -38,7 +38,7 @@ class MultiRegistryTest {
     static final AtomicInteger supervisorTerminated = new AtomicInteger();
     static final AtomicInteger signalingTerminated  = new AtomicInteger();
 
-    static class SupervisorMachine extends Machine<CallTask, SupervisorCtx> {
+    static class SupervisorMachine extends Machine<SupervisorCtx> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -51,8 +51,7 @@ class MultiRegistryTest {
                         // Spawn a sibling SignalingMachine for the same id, via the registry.
                         // The supervisor doesn't hold any reference to it.
                         var reg = (MultiRegistry) holder.registry;
-                        reg.spawn(m.getMachineId(), SignalingMachine.class,
-                            m.getPersistingEntity());
+                        reg.spawn(m.getMachineId(), SignalingMachine.class, null);
                     })
                     .on(SignalingDone.class, "ENDING")
                     .on(HangupNow.class,     "FAILED")
@@ -75,7 +74,7 @@ class MultiRegistryTest {
 
     // ── child machine — publishes back to parent ──────────────────────
 
-    static class SignalingMachine extends Machine<CallTask, SignalingCtx> {
+    static class SignalingMachine extends Machine<SignalingCtx> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -134,7 +133,7 @@ class MultiRegistryTest {
         // publish SignalingDone. The parent will transition to ENDING (final),
         // which cascades cleanup to the child.
         String uuid = "call-1";
-        reg.spawn(uuid, SupervisorMachine.class, new CallTask(uuid));
+        reg.spawn(uuid, SupervisorMachine.class, new SupervisorCtx());
 
         assertTrue(reg.awaitIdle(2, TimeUnit.SECONDS), "registry should drain");
 

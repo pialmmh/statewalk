@@ -44,10 +44,13 @@ import java.util.function.Function;
  * {@link #setRegistry(MachineRegistryHandle)} has not been called. Machines are
  * not standalone — they only exist as registry-managed resources.
  *
- * @param <E> persisting entity type (the per-request task / payload)
- * @param <C> volatile context type (machine-scoped, cleared on reset)
+ * @param <C> context type — the single state slot per machine. Set at
+ *            dispatch time by the registry; mutated by state actions;
+ *            snapshotted on every transition when persistence is configured;
+ *            cleared on reset. There is no separate "persisting entity" or
+ *            "task" generic — the dispatched value IS the initial context.
  */
-public abstract class Machine<E, C> implements Poolable {
+public abstract class Machine<C> implements Poolable {
 
     /**
      * Framework logger inherited by every machine type. Subclasses should not
@@ -62,7 +65,6 @@ public abstract class Machine<E, C> implements Poolable {
     /** Bound by the registry on borrow; cleared on reset. */
     private MachineRegistryHandle registry;
     private String machineId;
-    private E persistingEntity;
     private C context;
 
     /**
@@ -81,7 +83,7 @@ public abstract class Machine<E, C> implements Poolable {
      * {@link #rehydrate} after the persistent {@code context} is in place
      * but before any state action runs.
      */
-    private Function<Machine<?, ?>, Object> volatileLoader;
+    private Function<Machine<?>, Object> volatileLoader;
 
     /** "IDLE" until start; otherwise the current state's name. */
     private volatile String currentState = StateMap.IDLE;
@@ -113,10 +115,12 @@ public abstract class Machine<E, C> implements Poolable {
     protected abstract StateMap defineStates();
 
     /**
-     * Allocate a fresh volatile context. Called once on construction (or when
-     * a pooled instance was reset and the context needs re-creation).
+     * Allocate an initial context when dispatch did NOT provide one. Default
+     * returns {@code null}; override only if your machine type supports
+     * dispatch-without-context (uncommon — most call sites pass a fully
+     * populated context to {@code registry.dispatch(id, ctx)}).
      */
-    protected abstract C createContext();
+    protected C createContext() { return null; }
 
     /**
      * Subclass hook for reset. Called from {@link #resetForReuse()} after
@@ -149,9 +153,13 @@ public abstract class Machine<E, C> implements Poolable {
         this.machineId = id;
     }
 
-    /** @hidden */
-    public final void setPersistingEntity(E entity) {
-        this.persistingEntity = entity;
+    /**
+     * @hidden Seat the initial context. Called by the registry on dispatch
+     * before {@link #start()}. If not called, {@link #start()} falls back to
+     * {@link #createContext()}.
+     */
+    public final void setInitialContext(C ctx) {
+        this.context = ctx;
     }
 
     /** @hidden Set by the registry on dispatch — do not call from user code. */
@@ -162,7 +170,7 @@ public abstract class Machine<E, C> implements Poolable {
      * @hidden Set by the registry on borrow (dispatch + rehydrate) before the
      * machine starts. The same callback fires on both creation and rehydration.
      */
-    public final void setVolatileContextLoader(Function<Machine<?, ?>, Object> loader) {
+    public final void setVolatileContextLoader(Function<Machine<?>, Object> loader) {
         this.volatileLoader = loader;
     }
 
@@ -171,7 +179,6 @@ public abstract class Machine<E, C> implements Poolable {
     // ─────────────────────────────────────────────────────────────────
 
     public final String getMachineId() { return machineId; }
-    public final E getPersistingEntity() { return persistingEntity; }
     public final C getContext() { return context; }
     public final String getCurrentState() { return currentState; }
     public final boolean isStarted() { return started; }
@@ -239,7 +246,7 @@ public abstract class Machine<E, C> implements Poolable {
      * context surfaces at the call site, not as a poisoned machine.
      */
     private void populateVolatileContext() {
-        Function<Machine<?, ?>, Object> ldr = this.volatileLoader;
+        Function<Machine<?>, Object> ldr = this.volatileLoader;
         if (ldr == null) return;
         try {
             this.volatileContext = ldr.apply(this);
@@ -539,7 +546,6 @@ public abstract class Machine<E, C> implements Poolable {
 
         registry = null;
         machineId = null;
-        persistingEntity = null;
         context = null;
         volatileContext = null;
         volatileLoader = null;

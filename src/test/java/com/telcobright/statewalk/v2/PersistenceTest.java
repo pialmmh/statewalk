@@ -59,7 +59,7 @@ class PersistenceTest {
     static final AtomicInteger entryActionRuns = new AtomicInteger(0);
     static final AtomicInteger exitActionRuns = new AtomicInteger(0);
 
-    static class CallMachine extends Machine<CallTask, CallContext> {
+    static class CallMachine extends Machine<CallContext> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -69,9 +69,6 @@ class PersistenceTest {
                     .onEntry(self -> {
                         entryActionRuns.incrementAndGet();
                         CallMachine m = (CallMachine) self;
-                        if (m.getPersistingEntity() != null) {
-                            m.getContext().calledNumber = m.getPersistingEntity().calledNumber();
-                        }
                     })
                     .onExit(self -> exitActionRuns.incrementAndGet())
                     .timeout(60, TimeUnit.SECONDS, "FAILED")
@@ -110,7 +107,7 @@ class PersistenceTest {
         @Override protected CallMachine createMachineTemplate() { return new CallMachine(); }
         @Override
         protected Object createTaskFromFirstEvent(String requestId, StatemachineEvent firstEvent) {
-            if (firstEvent instanceof StartCall sc) return new CallTask(sc.calledNumber());
+            if (firstEvent instanceof StartCall sc) { CallContext c = new CallContext(); c.calledNumber = sc.calledNumber(); return c; }
             return super.createTaskFromFirstEvent(requestId, firstEvent);
         }
     }

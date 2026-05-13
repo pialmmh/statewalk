@@ -38,7 +38,7 @@ class OfflineRehydrationTest {
     static final AtomicInteger closedEntryRuns         = new AtomicInteger(0);
     static final AtomicInteger expiredEntryRuns        = new AtomicInteger(0);
 
-    static class SessionMachine extends Machine<SessionTask, SessionContext> {
+    static class SessionMachine extends Machine<SessionContext> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -50,9 +50,6 @@ class OfflineRehydrationTest {
                     .onEntry(self -> {
                         suspendedEntryRuns.incrementAndGet();
                         SessionMachine m = (SessionMachine) self;
-                        if (m.getPersistingEntity() != null) {
-                            m.getContext().userId = m.getPersistingEntity().userId();
-                        }
                     })
                     .onExit(self -> suspendedExitRuns.incrementAndGet())
                     .on(Heartbeat.class,    "SUSPENDED")
@@ -77,7 +74,7 @@ class OfflineRehydrationTest {
         @Override protected SessionMachine createMachineTemplate() { return new SessionMachine(); }
         @Override
         protected Object createTaskFromFirstEvent(String requestId, StatemachineEvent firstEvent) {
-            if (firstEvent instanceof OpenSession o) return new SessionTask(o.userId());
+            if (firstEvent instanceof OpenSession o) { SessionContext c = new SessionContext(); c.userId = o.userId(); return c; }
             return super.createTaskFromFirstEvent(requestId, firstEvent);
         }
     }

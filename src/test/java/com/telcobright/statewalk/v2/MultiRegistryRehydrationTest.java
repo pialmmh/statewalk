@@ -58,7 +58,7 @@ class MultiRegistryRehydrationTest {
     static final AtomicInteger balanceEntries    = new AtomicInteger();
     static final AtomicInteger volatileLoaderCalls = new AtomicInteger();
 
-    static class SupervisorM extends Machine<CallTask, SupervisorCtx> {
+    static class SupervisorM extends Machine<SupervisorCtx> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -69,9 +69,6 @@ class MultiRegistryRehydrationTest {
                     .onEntry(self -> {
                         supervisorEntries.incrementAndGet();
                         SupervisorM m = (SupervisorM) self;
-                        if (m.getPersistingEntity() != null) {
-                            m.getContext().caller = m.getPersistingEntity().caller();
-                        }
                     })
                     .on(PingSupervisor.class, "WORKING")
                     .on(Hangup.class,         "DONE")
@@ -83,7 +80,7 @@ class MultiRegistryRehydrationTest {
         @Override protected SupervisorCtx createContext() { return new SupervisorCtx(); }
     }
 
-    static class BalanceM extends Machine<CallTask, BalanceCtx> {
+    static class BalanceM extends Machine<BalanceCtx> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -142,8 +139,8 @@ class MultiRegistryRehydrationTest {
         registry = build();
 
         String uuid = "call-A";
-        registry.spawn(uuid, SupervisorM.class, new CallTask(uuid, "alice"));
-        registry.spawn(uuid, BalanceM.class,    new CallTask(uuid, "alice"));
+        registry.spawn(uuid, SupervisorM.class, ((java.util.function.Supplier<SupervisorCtx>) () -> { SupervisorCtx c = new SupervisorCtx(); c.caller = "alice"; return c; }).get());
+        registry.spawn(uuid, BalanceM.class, new BalanceCtx());
         assertTrue(registry.awaitIdle(2, TimeUnit.SECONDS));
 
         // Both cells entered offline (interim+offline), so both are suspended
@@ -161,8 +158,8 @@ class MultiRegistryRehydrationTest {
         registry = build();
 
         String uuid = "call-B";
-        registry.spawn(uuid, SupervisorM.class, new CallTask(uuid, "bob"));
-        registry.spawn(uuid, BalanceM.class,    new CallTask(uuid, "bob"));
+        registry.spawn(uuid, SupervisorM.class, ((java.util.function.Supplier<SupervisorCtx>) () -> { SupervisorCtx c = new SupervisorCtx(); c.caller = "bob"; return c; }).get());
+        registry.spawn(uuid, BalanceM.class, new BalanceCtx());
         assertTrue(registry.awaitIdle(2, TimeUnit.SECONDS));
 
         int supEntriesPre = supervisorEntries.get();    // 1
@@ -210,7 +207,7 @@ class MultiRegistryRehydrationTest {
         registry = build();
 
         String uuid = "call-C";
-        registry.spawn(uuid, BalanceM.class, new CallTask(uuid, "carol"));
+        registry.spawn(uuid, BalanceM.class, new BalanceCtx());
         assertTrue(registry.awaitIdle(2, TimeUnit.SECONDS));
 
         // Balance went offline → snapshot saved with BalanceCtx serialized.

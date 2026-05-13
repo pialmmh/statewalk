@@ -41,20 +41,20 @@ public final class MultiRegistry {
     private static final Logger LOG = LoggerFactory.getLogger(MultiRegistry.class);
 
     private final String name;
-    private final Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children;
-    private final Class<? extends Machine<?, ?>> primaryType;
+    private final Map<Class<? extends Machine<?>>, Registry<?, ?>> children;
+    private final Class<? extends Machine<?>> primaryType;
     private final InternalEventResolver resolver;
     private final PersistenceProvider persistence;
     private final boolean rehydrateEnabled;
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
 
     /** Per-id set of currently-spawned machine types. Maintained on spawn + child terminate. */
-    private final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<Class<? extends Machine<?, ?>>>>
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<Class<? extends Machine<?>>>>
         activeCells = new java.util.concurrent.ConcurrentHashMap<>();
 
     private MultiRegistry(String name,
-                          Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children,
-                          Class<? extends Machine<?, ?>> primaryType,
+                          Map<Class<? extends Machine<?>>, Registry<?, ?>> children,
+                          Class<? extends Machine<?>> primaryType,
                           InternalEventResolver resolver,
                           PersistenceProvider persistence,
                           boolean rehydrateEnabled) {
@@ -78,7 +78,7 @@ public final class MultiRegistry {
     // ─────────────────────────────────────────────────────────────────
 
     /** Borrow a machine of {@code type} for {@code id} and start it. */
-    public void spawn(String id, Class<? extends Machine<?, ?>> type, Object task) {
+    public void spawn(String id, Class<? extends Machine<?>> type, Object task) {
         if (shuttingDown.get()) return;
         Registry<?, ?> r = children.get(type);
         if (r == null) throw new IllegalArgumentException("Unknown machine type: " + type.getName());
@@ -103,7 +103,7 @@ public final class MultiRegistry {
     }
 
     /** Force-cleanup one cell. */
-    public void forceCleanup(String id, Class<? extends Machine<?, ?>> type) {
+    public void forceCleanup(String id, Class<? extends Machine<?>> type) {
         Registry<?, ?> r = children.get(type);
         if (r != null) r.forceCleanupMachine(id);
     }
@@ -126,7 +126,7 @@ public final class MultiRegistry {
     // Observation
     // ─────────────────────────────────────────────────────────────────
 
-    public Machine<?, ?> findMachine(String id, Class<? extends Machine<?, ?>> type) {
+    public Machine<?> findMachine(String id, Class<? extends Machine<?>> type) {
         Registry<?, ?> r = children.get(type);
         return r == null ? null : r.getMachine(id);
     }
@@ -257,7 +257,7 @@ public final class MultiRegistry {
     }
 
     /** Called from every inner Registry's handleTermination override. */
-    private void onChildTerminated(String id, Class<? extends Machine<?, ?>> type) {
+    private void onChildTerminated(String id, Class<? extends Machine<?>> type) {
         // Track this cell as gone; remove the id from activeCells once empty.
         activeCells.computeIfPresent(id, (k, set) -> {
             set.remove(type);
@@ -286,7 +286,7 @@ public final class MultiRegistry {
      * </ul>
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private static <M extends Machine<?, ?>> Registry<M, ?> buildInnerRegistry(
+    private static <M extends Machine<?>> Registry<M, ?> buildInnerRegistry(
             String parentName,
             Class<M> machineType,
             Supplier<M> factory,
@@ -324,11 +324,11 @@ public final class MultiRegistry {
     public static final class Builder {
 
         private record TypeSpec(
-            Supplier<? extends Machine<?, ?>> factory,
+            Supplier<? extends Machine<?>> factory,
             int maxConcurrent,
             int poolSize,
             int timeoutThreads,
-            Function<Machine<?, ?>, Object> volatileLoader,
+            Function<Machine<?>, Object> volatileLoader,
             long globalTimeoutMs,
             String globalTimeoutTargetState
         ) {}
@@ -336,8 +336,8 @@ public final class MultiRegistry {
         private final String name;
         private final EventTypeRegistry eventTypes = new EventTypeRegistry();
         private final InternalEventResolver resolver = new InternalEventResolver();
-        private final Map<Class<? extends Machine<?, ?>>, TypeSpec> typeSpecs = new LinkedHashMap<>();
-        private Class<? extends Machine<?, ?>> primaryType;
+        private final Map<Class<? extends Machine<?>>, TypeSpec> typeSpecs = new LinkedHashMap<>();
+        private Class<? extends Machine<?>> primaryType;
         private PersistenceProvider persistence;
         private boolean rehydrateEnabled;
 
@@ -365,15 +365,15 @@ public final class MultiRegistry {
             return this;
         }
 
-        public <M extends Machine<?, ?>> Builder machine(
+        public <M extends Machine<?>> Builder machine(
                 Class<M> type, Supplier<M> factory, int poolSize) {
             return machine(type, factory, poolSize, poolSize, 2, null, 0L, null);
         }
 
-        public <M extends Machine<?, ?>> Builder machine(
+        public <M extends Machine<?>> Builder machine(
                 Class<M> type, Supplier<M> factory, int poolSize, int maxConcurrent,
                 int timeoutThreads,
-                Function<Machine<?, ?>, Object> volatileLoader,
+                Function<Machine<?>, Object> volatileLoader,
                 long globalTimeoutMs, String globalTimeoutTargetState) {
             if (typeSpecs.containsKey(type)) {
                 throw new IllegalStateException("Duplicate machine type: " + type.getName());
@@ -383,7 +383,7 @@ public final class MultiRegistry {
             return this;
         }
 
-        public Builder primary(Class<? extends Machine<?, ?>> type) {
+        public Builder primary(Class<? extends Machine<?>> type) {
             if (!typeSpecs.containsKey(type)) {
                 throw new IllegalStateException("Primary type not registered: " + type.getName());
             }
@@ -393,7 +393,7 @@ public final class MultiRegistry {
 
         public <E extends StatemachineEvent> Builder route(
                 Class<E> eventClass,
-                Class<? extends Machine<?, ?>> targetType,
+                Class<? extends Machine<?>> targetType,
                 Function<E, String> idExtractor) {
             if (!typeSpecs.containsKey(targetType)) {
                 throw new IllegalStateException("Route target type not registered: " + targetType.getName());
@@ -411,7 +411,7 @@ public final class MultiRegistry {
                 throw new IllegalStateException(
                     "rehydrate(true) requires .persistence(...) on the MultiRegistry builder");
             }
-            Map<Class<? extends Machine<?, ?>>, Registry<?, ?>> children = new LinkedHashMap<>();
+            Map<Class<? extends Machine<?>>, Registry<?, ?>> children = new LinkedHashMap<>();
             // Build the MultiRegistry first (so inner registries can refer back).
             // Two-phase: create object, then populate children + initialize.
             MultiRegistry mr = new MultiRegistry(name, children, primaryType, resolver,

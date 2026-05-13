@@ -48,7 +48,7 @@ class SmokeTest {
 
     // ─── machine ──────────────────────────────────────────────────────
 
-    static class DemoMachine extends Machine<DemoTask, DemoContext> {
+    static class DemoMachine extends Machine<DemoContext> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -120,7 +120,7 @@ class SmokeTest {
 
     @Test
     void dispatch_transitions_to_initial_state() throws InterruptedException {
-        assertTrue(system.dispatch("demo", "req-1", new DemoTask("hello")));
+        assertTrue(system.dispatch("demo", "req-1", new DemoContext()));
         await();
         DemoMachine m = demo.getMachine("req-1");
         assertNotNull(m);
@@ -131,7 +131,7 @@ class SmokeTest {
 
     @Test
     void inbound_event_drives_stay_action() throws InterruptedException {
-        system.dispatch("demo", "req-2", new DemoTask("loop"));
+        system.dispatch("demo", "req-2", new DemoContext());
         channel.inject("req-2", new Hello());
         channel.inject("req-2", new Hello());
         channel.inject("req-2", new Hello());
@@ -145,7 +145,7 @@ class SmokeTest {
     @Test
     void terminal_state_triggers_ritual_and_pool_return() throws InterruptedException {
         var before = demo.getPoolStatistics();
-        system.dispatch("demo", "req-3", new DemoTask("done"));
+        system.dispatch("demo", "req-3", new DemoContext());
         await();
         DemoMachine m = demo.getMachine("req-3");
         DemoContext ctx = m.getContext();
@@ -165,7 +165,7 @@ class SmokeTest {
 
     @Test
     void late_event_after_terminal_is_silently_dropped() throws InterruptedException {
-        system.dispatch("demo", "req-4", new DemoTask("late"));
+        system.dispatch("demo", "req-4", new DemoContext());
         channel.inject("req-4", new Goodbye());
         await();
         assertDoesNotThrow(() -> channel.inject("req-4", new Hello()));
@@ -175,15 +175,15 @@ class SmokeTest {
 
     @Test
     void duplicate_dispatch_on_same_id_is_rejected() throws InterruptedException {
-        assertTrue(system.dispatch("demo", "req-5", new DemoTask("first")));
-        assertFalse(system.dispatch("demo", "req-5", new DemoTask("second")));
+        assertTrue(system.dispatch("demo", "req-5", new DemoContext()));
+        assertFalse(system.dispatch("demo", "req-5", new DemoContext()));
         await();
         assertEquals(1, demo.getActiveCount());
     }
 
     @Test
     void unregistered_event_throws_on_dispatch() throws InterruptedException {
-        system.dispatch("demo", "req-6", new DemoTask("typed"));
+        system.dispatch("demo", "req-6", new DemoContext());
         await();
         IllegalStateException ex = assertThrows(IllegalStateException.class,
             () -> channel.inject("req-6", new Unregistered()));
@@ -279,7 +279,7 @@ class SmokeTest {
             .channel("d", ch)
             .build();
         try {
-            sys.dispatch("d", "p-1", new DemoTask("p"));
+            sys.dispatch("d", "p-1", new DemoContext());
             sys.awaitIdle(AWAIT);
 
             var stats0 = sys.getEventTypes().poolStatistics().get(PoolableHello.class);
@@ -327,7 +327,7 @@ class SmokeTest {
     @Test
     void offline_state_without_persistence_is_rejected_by_builder() {
         // A registry whose machine has an offline state — but no persistence configured.
-        class OfflineMachine extends Machine<DemoTask, DemoContext> {
+        class OfflineMachine extends Machine<DemoContext> {
             @Override protected StateMap defineStates() {
                 return StateMap.builder()
                     .initialState("WAIT")
@@ -391,7 +391,7 @@ class SmokeTest {
             .globalTimeout("d", Duration.ofMillis(200), "CLOSED")
             .build();
         try {
-            sys.dispatch("d", "gt-1", new DemoTask("timed-out"));
+            sys.dispatch("d", "gt-1", new DemoContext());
             sys.awaitIdle(AWAIT);
             assertNotNull(r.getMachine("gt-1"));
 

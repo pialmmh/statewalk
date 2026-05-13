@@ -23,7 +23,7 @@ import java.util.List;
  * <p>Children must hold IS-A {@code Registry} of their own machine type; they
  * are referenced by name (case-sensitive) in {@link #spawnChild} / {@link #toChild}.
  */
-public abstract class SupervisorRegistry<M extends Machine<?, C>, C> extends Registry<M, C> {
+public abstract class SupervisorRegistry<M extends Machine<C>, C> extends Registry<M, C> {
 
     /**
      * Declare the child registries this supervisor coordinates. Order is the

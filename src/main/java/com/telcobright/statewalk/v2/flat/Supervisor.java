@@ -18,11 +18,11 @@ import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
  * resolver is the only path; the resolver is the supervisor's member; the
  * supervisor's class is the user's only handle.
  *
- * @param <E> task (persisting entity) type
- * @param <C> persistent context type — saved to snapshot; volatile context
- *            stays out of persistence per framework rule.
+ * @param <C> context type — initial context provided at dispatch by the
+ *            registry; mutated by state actions and steps; snapshotted on
+ *            every transition. Volatile context stays out of persistence.
  */
-public abstract class Supervisor<E, C> extends Machine<E, C> {
+public abstract class Supervisor<C> extends Machine<C> {
 
     /** The supervisor's bus. Populated once in constructor. */
     protected final InternalEventResolver resolver;

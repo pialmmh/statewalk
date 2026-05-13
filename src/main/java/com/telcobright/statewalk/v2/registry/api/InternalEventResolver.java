@@ -18,7 +18,7 @@ import java.util.function.Function;
 public final class InternalEventResolver {
 
     public record Rule<E extends StatemachineEvent>(
-        Class<? extends Machine<?, ?>> targetType,
+        Class<? extends Machine<?>> targetType,
         Function<E, String> idExtractor) {}
 
     private final Map<Class<? extends StatemachineEvent>, Rule<?>> rules = new HashMap<>();
@@ -27,7 +27,7 @@ public final class InternalEventResolver {
 
     public <E extends StatemachineEvent> void register(
             Class<E> eventClass,
-            Class<? extends Machine<?, ?>> targetType,
+            Class<? extends Machine<?>> targetType,
             Function<E, String> idExtractor) {
         if (rules.containsKey(eventClass)) {
             throw new IllegalStateException("Duplicate route for " + eventClass.getName());

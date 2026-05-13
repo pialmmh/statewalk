@@ -60,11 +60,11 @@ public class Registry implements Machine.MachineRegistryHandle {
     public static final String CHILD_ID_SEPARATOR = "#";
 
     private final String name;
-    private final Class<? extends Supervisor<?, ?>> supervisorType;
-    private final Map<Class<? extends Machine<?, ?>>, TypeSpec> types;
-    private final Map<Class<? extends Machine<?, ?>>, ObjectPoolManager<? extends Machine<?, ?>>> pools;
+    private final Class<? extends Supervisor<?>> supervisorType;
+    private final Map<Class<? extends Machine<?>>, TypeSpec> types;
+    private final Map<Class<? extends Machine<?>>, ObjectPoolManager<? extends Machine<?>>> pools;
 
-    private final ConcurrentHashMap<String, List<Machine<?, ?>>> active = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, List<Machine<?>>> active = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<Void>> chains = new ConcurrentHashMap<>();
     private final Set<String> terminated = ConcurrentHashMap.newKeySet();
 
@@ -73,8 +73,8 @@ public class Registry implements Machine.MachineRegistryHandle {
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
 
     Registry(String name,
-             Class<? extends Supervisor<?, ?>> supervisorType,
-             Map<Class<? extends Machine<?, ?>>, TypeSpec> types,
+             Class<? extends Supervisor<?>> supervisorType,
+             Map<Class<? extends Machine<?>>, TypeSpec> types,
              int threads) {
         this.name = name;
         this.supervisorType = supervisorType;
@@ -90,8 +90,8 @@ public class Registry implements Machine.MachineRegistryHandle {
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private ObjectPoolManager<? extends Machine<?, ?>> makePool(
-            Class<? extends Machine<?, ?>> cls, TypeSpec spec) {
+    private ObjectPoolManager<? extends Machine<?>> makePool(
+            Class<? extends Machine<?>> cls, TypeSpec spec) {
         return new ObjectPoolManager(
             name + "-" + cls.getSimpleName(),
             (Supplier) spec.factory(),
@@ -113,7 +113,7 @@ public class Registry implements Machine.MachineRegistryHandle {
             LOG.warn("[{}] duplicate dispatch for id={}", name, parentId);
             return;
         }
-        Machine<?, ?> sup = borrowAndStart(supervisorType, parentId, task);
+        Machine<?> sup = borrowAndStart(supervisorType, parentId, task);
         if (sup == null) return;
         active.computeIfAbsent(parentId, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(sup);
     }
@@ -123,13 +123,13 @@ public class Registry implements Machine.MachineRegistryHandle {
      *  there. */
     public void onInboundEvent(String parentId, StatemachineEvent event) {
         if (shuttingDown.get()) return;
-        Machine<?, ?> sup = supervisorOf(parentId);
+        Machine<?> sup = supervisorOf(parentId);
         if (sup == null) {
             LOG.debug("[{}] no supervisor for id={}, event {} dropped",
                 name, parentId, event.getClass().getSimpleName());
             return;
         }
-        Supervisor<?, ?> supervisor = (Supervisor<?, ?>) sup;
+        Supervisor<?> supervisor = (Supervisor<?>) sup;
         chainSubmit(cellKey(parentId, supervisorType), () -> {
             try { supervisor.handleInbound(event); }
             catch (Throwable t) {
@@ -187,7 +187,7 @@ public class Registry implements Machine.MachineRegistryHandle {
     // Package-private — InternalEventResolver is the ONLY caller
     // ─────────────────────────────────────────────────────────────────
 
-    void spawnChildInternal(String parentId, Class<? extends Machine<?, ?>> childType, Object task) {
+    void spawnChildInternal(String parentId, Class<? extends Machine<?>> childType, Object task) {
         if (shuttingDown.get()) return;
         if (childType == supervisorType) {
             throw new IllegalArgumentException("Cannot spawn supervisor as a child");
@@ -195,31 +195,31 @@ public class Registry implements Machine.MachineRegistryHandle {
         if (!types.containsKey(childType)) {
             throw new IllegalArgumentException("Unknown machine type: " + childType.getName());
         }
-        Machine<?, ?> existing = findChildInternal(parentId, childType);
+        Machine<?> existing = findChildInternal(parentId, childType);
         if (existing != null) {
             LOG.debug("[{}] child {} already present for id={}", name, childType.getSimpleName(), parentId);
             return;
         }
-        Machine<?, ?> child = borrowAndStart(childType, childId(parentId, childType), task);
+        Machine<?> child = borrowAndStart(childType, childId(parentId, childType), task);
         if (child == null) return;
         active.get(parentId).add(child);
     }
 
-    void cleanupChildInternal(String parentId, Class<? extends Machine<?, ?>> childType) {
-        Machine<?, ?> child = findChildInternal(parentId, childType);
+    void cleanupChildInternal(String parentId, Class<? extends Machine<?>> childType) {
+        Machine<?> child = findChildInternal(parentId, childType);
         if (child == null) return;
         onCellTerminated(parentId, childType);
     }
 
-    void forwardToChild(String parentId, Class<? extends Machine<?, ?>> childType,
+    void forwardToChild(String parentId, Class<? extends Machine<?>> childType,
                         StatemachineEvent event) {
-        Machine<?, ?> child = findChildInternal(parentId, childType);
+        Machine<?> child = findChildInternal(parentId, childType);
         if (child == null) {
             LOG.debug("[{}] no {} for id={}, drop {}",
                 name, childType.getSimpleName(), parentId, event.getClass().getSimpleName());
             return;
         }
-        final Machine<?, ?> m = child;
+        final Machine<?> m = child;
         chainSubmit(cellKey(parentId, childType), () -> {
             try { m.fire(event); }
             catch (Throwable t) {
@@ -229,25 +229,25 @@ public class Registry implements Machine.MachineRegistryHandle {
         });
     }
 
-    Machine<?, ?> findChildInternal(String parentId, Class<? extends Machine<?, ?>> childType) {
+    Machine<?> findChildInternal(String parentId, Class<? extends Machine<?>> childType) {
         return findInternal(parentId, childType);
     }
 
     /** Package-private introspection — any machine type in the row, supervisor included. */
-    Machine<?, ?> findInternal(String parentId, Class<? extends Machine<?, ?>> type) {
-        List<Machine<?, ?>> list = active.get(parentId);
+    Machine<?> findInternal(String parentId, Class<? extends Machine<?>> type) {
+        List<Machine<?>> list = active.get(parentId);
         if (list == null) return null;
-        for (Machine<?, ?> m : list) {
+        for (Machine<?> m : list) {
             if (m.getClass() == type) return m;
         }
         return null;
     }
 
     void forceCleanupAll(String parentId) {
-        List<Machine<?, ?>> list = active.get(parentId);
+        List<Machine<?>> list = active.get(parentId);
         if (list == null) return;
-        for (Machine<?, ?> m : new ArrayList<>(list)) {
-            try { onCellTerminated(parentId, (Class<? extends Machine<?, ?>>) m.getClass()); }
+        for (Machine<?> m : new ArrayList<>(list)) {
+            try { onCellTerminated(parentId, (Class<? extends Machine<?>>) m.getClass()); }
             catch (RuntimeException ignored) {}
         }
     }
@@ -276,8 +276,8 @@ public class Registry implements Machine.MachineRegistryHandle {
     static final class PerMachineHandle implements Machine.MachineRegistryHandle {
         final Registry reg;
         final String parentId;
-        final Class<? extends Machine<?, ?>> type;
-        PerMachineHandle(Registry reg, String parentId, Class<? extends Machine<?, ?>> type) {
+        final Class<? extends Machine<?>> type;
+        PerMachineHandle(Registry reg, String parentId, Class<? extends Machine<?>> type) {
             this.reg = reg; this.parentId = parentId; this.type = type;
         }
         @Override public ScheduledFuture<?> schedule(String mid, Runnable r, long d, TimeUnit u) {
@@ -300,8 +300,8 @@ public class Registry implements Machine.MachineRegistryHandle {
     // ─────────────────────────────────────────────────────────────────
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private Machine<?, ?> borrowAndStart(
-            Class<? extends Machine<?, ?>> type, String id, Object task) {
+    private Machine<?> borrowAndStart(
+            Class<? extends Machine<?>> type, String id, Object task) {
         TypeSpec spec = types.get(type);
         if (spec == null) {
             LOG.error("[{}] unknown machine type {}", name, type.getName());
@@ -320,7 +320,7 @@ public class Registry implements Machine.MachineRegistryHandle {
         String parentId = isChildId(id) ? id.substring(0, id.indexOf(CHILD_ID_SEPARATOR)) : id;
         m.setRegistry(new PerMachineHandle(this, parentId, type));
         m.setMachineId(id);
-        ((Machine) m).setPersistingEntity(task);
+        if (task != null) ((Machine) m).setInitialContext(task);
 
         final Machine machine = m;
         chainSubmit(cellKey(parentId, type), () -> {
@@ -334,14 +334,14 @@ public class Registry implements Machine.MachineRegistryHandle {
         return m;
     }
 
-    private void onCellTerminated(String parentId, Class<? extends Machine<?, ?>> type) {
+    private void onCellTerminated(String parentId, Class<? extends Machine<?>> type) {
         String key = cellKey(parentId, type);
         if (!terminated.add(key)) return;
 
-        List<Machine<?, ?>> list = active.get(parentId);
+        List<Machine<?>> list = active.get(parentId);
         if (list == null) { terminated.remove(key); return; }
-        Machine<?, ?> machine = null;
-        for (Machine<?, ?> m : list) {
+        Machine<?> machine = null;
+        for (Machine<?> m : list) {
             if (m.getClass() == type) { machine = m; break; }
         }
         if (machine == null) { terminated.remove(key); return; }
@@ -360,9 +360,9 @@ public class Registry implements Machine.MachineRegistryHandle {
 
         // Cascade if the supervisor terminated.
         if (type == supervisorType) {
-            for (Machine<?, ?> sibling : new ArrayList<>(list)) {
+            for (Machine<?> sibling : new ArrayList<>(list)) {
                 @SuppressWarnings("unchecked")
-                Class<? extends Machine<?, ?>> sibType = (Class<? extends Machine<?, ?>>) sibling.getClass();
+                Class<? extends Machine<?>> sibType = (Class<? extends Machine<?>>) sibling.getClass();
                 try { onCellTerminated(parentId, sibType); } catch (RuntimeException ignored) {}
             }
             active.remove(parentId);
@@ -373,10 +373,10 @@ public class Registry implements Machine.MachineRegistryHandle {
         timeouts.schedule(() -> terminated.remove(key), 60, TimeUnit.SECONDS);
     }
 
-    private Machine<?, ?> supervisorOf(String parentId) {
-        List<Machine<?, ?>> list = active.get(parentId);
+    private Machine<?> supervisorOf(String parentId) {
+        List<Machine<?>> list = active.get(parentId);
         if (list == null || list.isEmpty()) return null;
-        Machine<?, ?> first = list.get(0);
+        Machine<?> first = list.get(0);
         return first.getClass() == supervisorType ? first : null;
     }
 
@@ -393,11 +393,11 @@ public class Registry implements Machine.MachineRegistryHandle {
         });
     }
 
-    private static String cellKey(String parentId, Class<? extends Machine<?, ?>> type) {
+    private static String cellKey(String parentId, Class<? extends Machine<?>> type) {
         return parentId + CHILD_ID_SEPARATOR + type.getSimpleName();
     }
 
-    private static String childId(String parentId, Class<? extends Machine<?, ?>> childType) {
+    private static String childId(String parentId, Class<? extends Machine<?>> childType) {
         return parentId + CHILD_ID_SEPARATOR + childType.getSimpleName();
     }
 
@@ -407,7 +407,7 @@ public class Registry implements Machine.MachineRegistryHandle {
     // Inner types
     // ─────────────────────────────────────────────────────────────────
 
-    record TypeSpec(Supplier<? extends Machine<?, ?>> factory, int poolSize) {}
+    record TypeSpec(Supplier<? extends Machine<?>> factory, int poolSize) {}
 
     // ─────────────────────────────────────────────────────────────────
     // Builder
@@ -415,14 +415,14 @@ public class Registry implements Machine.MachineRegistryHandle {
 
     public static final class Builder {
         private final String name;
-        private Class<? extends Supervisor<?, ?>> supervisorType;
-        private final Map<Class<? extends Machine<?, ?>>, TypeSpec> types = new LinkedHashMap<>();
+        private Class<? extends Supervisor<?>> supervisorType;
+        private final Map<Class<? extends Machine<?>>, TypeSpec> types = new LinkedHashMap<>();
         private int threads = 2;
 
         Builder(String name) { this.name = name; }
 
         /** First machine declared MUST be a Supervisor — it's machines[0] of every row. */
-        public <S extends Supervisor<?, ?>> Builder supervisor(
+        public <S extends Supervisor<?>> Builder supervisor(
                 Class<S> type, Supplier<S> factory, int poolSize) {
             if (supervisorType != null) {
                 throw new IllegalStateException("Supervisor already declared: " + supervisorType.getName());
@@ -432,7 +432,7 @@ public class Registry implements Machine.MachineRegistryHandle {
             return this;
         }
 
-        public <M extends Machine<?, ?>> Builder child(
+        public <M extends Machine<?>> Builder child(
                 Class<M> type, Supplier<M> factory, int poolSize) {
             if (supervisorType == null) {
                 throw new IllegalStateException("Declare .supervisor(...) before .child(...)");

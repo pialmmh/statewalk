@@ -43,7 +43,7 @@ class FlatRegistryTest {
 
     // ── child machines ────────────────────────────────────────────────
 
-    static class SignalingMachine extends Machine<CallTask, SigCtx> {
+    static class SignalingMachine extends Machine<SigCtx> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -77,7 +77,7 @@ class FlatRegistryTest {
         }
     }
 
-    static class BalanceMachine extends Machine<CallTask, BalCtx> {
+    static class BalanceMachine extends Machine<BalCtx> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -102,7 +102,7 @@ class FlatRegistryTest {
 
     // ── supervisor (concrete) ─────────────────────────────────────────
 
-    static class CallSupervisor extends Supervisor<CallTask, SupCtx> {
+    static class CallSupervisor extends Supervisor<SupCtx> {
         @Override
         protected void defineRoutes(InternalEventResolver r) {
             // supervisor's own state graph handles these
@@ -130,8 +130,8 @@ class FlatRegistryTest {
                     .timeout(5, TimeUnit.SECONDS, "DONE")
                     .onEntry(self -> {
                         CallSupervisor s = (CallSupervisor) self;
-                        s.resolver.spawnChild(SignalingMachine.class, s.getPersistingEntity());
-                        s.resolver.spawnChild(BalanceMachine.class,   s.getPersistingEntity());
+                        s.resolver.spawnChild(SignalingMachine.class, null);
+                        s.resolver.spawnChild(BalanceMachine.class, null);
                     })
                     .on(SignalingProgress.class, "RANG")
                     .on(StartCall.class, "ACTIVE")
@@ -173,7 +173,7 @@ class FlatRegistryTest {
         reg = build();
 
         String uuid = "call-A";
-        reg.dispatch(uuid, new CallTask(uuid));
+        reg.dispatch(uuid, new SupCtx());
         assertTrue(reg.awaitIdle(2, TimeUnit.SECONDS));
 
         // ACTIVE.entry spawned both children. They're in the active row.
@@ -200,7 +200,7 @@ class FlatRegistryTest {
         reg = build();
 
         String uuid = "call-B";
-        reg.dispatch(uuid, new CallTask(uuid));
+        reg.dispatch(uuid, new SupCtx());
         assertTrue(reg.awaitIdle(2, TimeUnit.SECONDS));
 
         reg.onInboundEvent(uuid, new FanoutPing(uuid));
@@ -219,7 +219,7 @@ class FlatRegistryTest {
         reg = build();
 
         String uuid = "call-C";
-        reg.dispatch(uuid, new CallTask(uuid));
+        reg.dispatch(uuid, new SupCtx());
         assertTrue(reg.awaitIdle(2, TimeUnit.SECONDS));
         assertEquals(3, reg.activeCellCount());
 
@@ -238,7 +238,7 @@ class FlatRegistryTest {
         reg = build();
 
         String uuid = "call-D";
-        reg.dispatch(uuid, new CallTask(uuid));
+        reg.dispatch(uuid, new SupCtx());
         assertTrue(reg.awaitIdle(2, TimeUnit.SECONDS));
 
         // Send an event nobody registered a route for.

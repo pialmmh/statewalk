@@ -40,15 +40,15 @@ public final class InternalEventResolver {
     /** A routing decision for one event class. */
     public sealed interface Rule {
         record Self() implements Rule {}
-        record ForwardOne(Class<? extends Machine<?, ?>> target) implements Rule {}
-        record ForwardMany(List<Class<? extends Machine<?, ?>>> targets) implements Rule {}
+        record ForwardOne(Class<? extends Machine<?>> target) implements Rule {}
+        record ForwardMany(List<Class<? extends Machine<?>>> targets) implements Rule {}
         record Drop() implements Rule {}
     }
 
-    private final Supervisor<?, ?> owner;
+    private final Supervisor<?> owner;
     private final Map<Class<? extends StatemachineEvent>, Rule> rules = new HashMap<>();
 
-    InternalEventResolver(Supervisor<?, ?> owner) {
+    InternalEventResolver(Supervisor<?> owner) {
         this.owner = owner;
     }
 
@@ -58,12 +58,12 @@ public final class InternalEventResolver {
         rules.put(eventClass, new Rule.Self());
     }
 
-    public void forwardTo(Class<? extends Machine<?, ?>> childType,
+    public void forwardTo(Class<? extends Machine<?>> childType,
                           Class<? extends StatemachineEvent> eventClass) {
         rules.put(eventClass, new Rule.ForwardOne(childType));
     }
 
-    public void forwardToAll(List<Class<? extends Machine<?, ?>>> childTypes,
+    public void forwardToAll(List<Class<? extends Machine<?>>> childTypes,
                               Class<? extends StatemachineEvent> eventClass) {
         rules.put(eventClass, new Rule.ForwardMany(List.copyOf(childTypes)));
     }
@@ -74,11 +74,11 @@ public final class InternalEventResolver {
 
     // ── Spawn / cleanup helpers used by the supervisor's state actions ─
 
-    public void spawnChild(Class<? extends Machine<?, ?>> childType, Object task) {
+    public void spawnChild(Class<? extends Machine<?>> childType, Object task) {
         owner.getOwningRegistry().spawnChildInternal(owner.getMachineId(), childType, task);
     }
 
-    public void cleanupChild(Class<? extends Machine<?, ?>> childType) {
+    public void cleanupChild(Class<? extends Machine<?>> childType) {
         owner.getOwningRegistry().cleanupChildInternal(owner.getMachineId(), childType);
     }
 

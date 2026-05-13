@@ -70,7 +70,7 @@ public final class Statewalk {
         private final Map<String, RegistryEntry> registries = new LinkedHashMap<>();
         private final List<ChannelBinding> channelBindings = new ArrayList<>();
         private final Map<String, GlobalTimeoutOverride> globalTimeoutOverrides = new LinkedHashMap<>();
-        private final Map<String, java.util.function.Function<com.telcobright.statewalk.v2.machine.Machine<?, ?>, Object>>
+        private final Map<String, java.util.function.Function<com.telcobright.statewalk.v2.machine.Machine<?>, Object>>
             volatileContextLoaders = new LinkedHashMap<>();
         private PersistenceProvider persistenceProvider;
         private boolean rehydrateEnabled;
@@ -224,7 +224,7 @@ public final class Statewalk {
          *                     volatile context object (caller-cast on use)
          */
         public Builder volatileLoader(String registryName,
-                java.util.function.Function<com.telcobright.statewalk.v2.machine.Machine<?, ?>, Object> loader) {
+                java.util.function.Function<com.telcobright.statewalk.v2.machine.Machine<?>, Object> loader) {
             if (registryName == null) throw new IllegalArgumentException("registryName required");
             if (loader == null) throw new IllegalArgumentException("loader required");
             volatileContextLoaders.put(registryName, loader);

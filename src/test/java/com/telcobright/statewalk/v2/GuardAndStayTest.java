@@ -50,7 +50,7 @@ class GuardAndStayTest {
     static final AtomicInteger rejectedEntry = new AtomicInteger();
     static final AtomicInteger stayBumpRuns  = new AtomicInteger();
 
-    static class Mach extends Machine<Task, Ctx> {
+    static class Mach extends Machine<Ctx> {
         @Override
         protected StateMap defineStates() {
             return StateMap.builder()
@@ -90,7 +90,7 @@ class GuardAndStayTest {
         @Override protected Mach   createMachineTemplate() { return new Mach(); }
         @Override
         protected Object createTaskFromFirstEvent(String requestId, StatemachineEvent first) {
-            if (first instanceof Open o) return new Task(o.userId());
+            if (first instanceof Open o) { Ctx c = new Ctx(); return c; }
             return super.createTaskFromFirstEvent(requestId, first);
         }
     }
@@ -180,7 +180,7 @@ class GuardAndStayTest {
     void guard_throwing_is_treated_as_false() throws InterruptedException {
         // Build a system with a guard that throws — should fall through to fallback.
         acceptedEntry.set(0); rejectedEntry.set(0);
-        class Throwy extends Machine<Task, Ctx> {
+        class Throwy extends Machine<Ctx> {
             @Override protected StateMap defineStates() {
                 return StateMap.builder()
                     .initialState("WORKING")
@@ -208,7 +208,7 @@ class GuardAndStayTest {
             @Override protected Throwy createMachineTemplate() { return new Throwy(); }
             @Override
             protected Object createTaskFromFirstEvent(String requestId, StatemachineEvent first) {
-                if (first instanceof Open o) return new Task(o.userId());
+                if (first instanceof Open o) { Ctx c = new Ctx(); return c; }
                 return super.createTaskFromFirstEvent(requestId, first);
             }
         };

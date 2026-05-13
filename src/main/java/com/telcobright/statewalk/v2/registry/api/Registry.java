@@ -60,7 +60,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * @param <M> machine type produced by this registry
  * @param <C> volatile context type for the machine
  */
-public abstract class Registry<M extends Machine<?, C>, C> implements Machine.MachineRegistryHandle {
+public abstract class Registry<M extends Machine<C>, C> implements Machine.MachineRegistryHandle {
 
     /**
      * Framework logger inherited by every registry type. Subclasses should not
@@ -254,7 +254,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
      * at dispatch and at rehydration. {@code null} means no volatile context
      * is loaded — machines see {@code null} from {@code getVolatileContext()}.
      */
-    private volatile java.util.function.Function<Machine<?, ?>, Object> volatileContextLoader;
+    private volatile java.util.function.Function<Machine<?>, Object> volatileContextLoader;
 
     // ─────────────────────────────────────────────────────────────────
     // Initialisation — package-private; only Statewalk.Builder may call.
@@ -273,7 +273,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
                           int debugSampleRate,
                           PersistenceProvider persistenceProvider, boolean rehydrateEnabled,
                           long globalTimeoutMsOverride, String globalTimeoutTargetStateOverride,
-                          java.util.function.Function<Machine<?, ?>, Object> volatileContextLoader) {
+                          java.util.function.Function<Machine<?>, Object> volatileContextLoader) {
         validateInit(poolSize, timeoutThreads);
         if (initialized) {
             throw new IllegalStateException(getRegistryName() + " already initialized");
@@ -414,8 +414,8 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
         machine.setMachineId(requestId);
         machine.setVolatileContextLoader(volatileContextLoader);
         @SuppressWarnings("unchecked")
-        Machine<Object, C> typed = (Machine<Object, C>) machine;
-        typed.setPersistingEntity(task);
+        Machine<C> typed = (Machine<C>) machine;
+        typed.setInitialContext((C) task);
 
         // Sample-based debug mode: every Nth machine traces every state change.
         boolean debug = false;
@@ -591,7 +591,7 @@ public abstract class Registry<M extends Machine<?, C>, C> implements Machine.Ma
 
         scheduleGlobalTimeout(requestId);
 
-        Machine<Object, C> typed = (Machine<Object, C>) machine;
+        Machine<C> typed = (Machine<C>) machine;
         typed.rehydrate(snap.currentState(), ctx, snap.timeoutTargetState(), snap.timeoutDeadlineMs());
 
         LOG.info("[{}] rehydrated id={} state={} timeoutFired={}",

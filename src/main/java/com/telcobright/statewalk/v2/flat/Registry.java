@@ -2,6 +2,9 @@ package com.telcobright.statewalk.v2.flat;
 
 import com.telcobright.statewalk.v2.executor.BoundedVirtualThreadExecutor;
 import com.telcobright.statewalk.v2.machine.Machine;
+import com.telcobright.statewalk.v2.persistence.MachineSnapshot;
+import com.telcobright.statewalk.v2.persistence.PersistenceProvider;
+import com.telcobright.statewalk.v2.persistence.SnapshotSerializer;
 import com.telcobright.statewalk.v2.pool.ObjectPoolManager;
 import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 import com.telcobright.statewalk.v2.timeout.TimeoutManager;
@@ -21,6 +24,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -72,21 +76,39 @@ public class Registry implements Machine.MachineRegistryHandle {
     private final TimeoutManager timeouts;
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
 
+    /** Persistence + rehydration config (optional). */
+    private final PersistenceProvider persistence;
+    private final boolean rehydrateEnabled;
+
+    /**
+     * Caller-supplied event → context builder. When an event with
+     * {@code isFirst() == true} arrives for an unknown id, this function is
+     * called to construct the initial context for the supervisor.
+     */
+    private final Function<StatemachineEvent, Object> firstEventToContext;
+
     Registry(String name,
              Class<? extends Supervisor<?>> supervisorType,
              Map<Class<? extends Machine<?>>, TypeSpec> types,
-             int threads) {
+             int threads,
+             PersistenceProvider persistence,
+             boolean rehydrateEnabled,
+             Function<StatemachineEvent, Object> firstEventToContext) {
         this.name = name;
         this.supervisorType = supervisorType;
         this.types = Map.copyOf(types);
         this.timeouts = new TimeoutManager(name, Math.max(2, threads));
         this.work = new BoundedVirtualThreadExecutor(name, Math.max(16, types.size() * 100));
+        this.persistence = persistence;
+        this.rehydrateEnabled = rehydrateEnabled;
+        this.firstEventToContext = firstEventToContext;
 
         this.pools = new ConcurrentHashMap<>();
         types.forEach((cls, spec) -> pools.put(cls, makePool(cls, spec)));
 
-        LOG.info("[{}] flat registry initialized — supervisor={}, types={}",
-            name, supervisorType.getSimpleName(), types.keySet());
+        LOG.info("[{}] flat registry initialized — supervisor={}, types={}, persistence={}, rehydrate={}",
+            name, supervisorType.getSimpleName(), types.keySet(),
+            persistence != null, rehydrateEnabled);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -113,21 +135,50 @@ public class Registry implements Machine.MachineRegistryHandle {
             LOG.warn("[{}] duplicate dispatch for id={}", name, parentId);
             return;
         }
-        Machine<?> sup = borrowAndStart(supervisorType, parentId, task);
-        if (sup == null) return;
-        active.computeIfAbsent(parentId, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(sup);
+        borrowAndStart(supervisorType, parentId, task);
     }
 
     /** Wire-inbound event arrives for {@code parentId}. Always delivered to
      *  the supervisor at position 0; the supervisor's resolver routes from
-     *  there. */
+     *  there.
+     *
+     *  <p>On unknown id the framework follows the design-checklist rules:
+     *  <ul>
+     *    <li>If the event is {@code isFirst()} and a {@code createFromFirstEvent}
+     *        hook is configured, build the initial context and dispatch.</li>
+     *    <li>Otherwise, if persistence + rehydration are configured, probe
+     *        for every cell of this id and restore any with snapshots.</li>
+     *    <li>Otherwise, throw {@link IllegalStateException} — the caller
+     *        sent an event for an id we don't know about and have no way to
+     *        recover (either by creation or by rehydration).</li>
+     *  </ul>
+     */
     public void onInboundEvent(String parentId, StatemachineEvent event) {
         if (shuttingDown.get()) return;
         Machine<?> sup = supervisorOf(parentId);
         if (sup == null) {
-            LOG.debug("[{}] no supervisor for id={}, event {} dropped",
-                name, parentId, event.getClass().getSimpleName());
-            return;
+            // First-event auto-creation path.
+            if (event.isFirst() && firstEventToContext != null) {
+                Object initialCtx = firstEventToContext.apply(event);
+                if (initialCtx != null) {
+                    dispatch(parentId, initialCtx);
+                    // Re-resolve supervisor now that it's been spawned.
+                    sup = supervisorOf(parentId);
+                }
+            }
+            // Rehydration path.
+            if (sup == null && rehydrateEnabled) {
+                int restored = restoreAllCellsFor(parentId);
+                if (restored > 0) sup = supervisorOf(parentId);
+            }
+            if (sup == null) {
+                // Per checklist: throw when no recovery path exists.
+                throw new IllegalStateException(
+                    "[" + name + "] no supervisor for id=" + parentId
+                    + " and event " + event.getClass().getSimpleName()
+                    + " is not first / no creation hook / no rehydration. "
+                    + "Configure .createFromFirstEvent(...) or .persistence(...).rehydrate(true).");
+            }
         }
         Supervisor<?> supervisor = (Supervisor<?>) sup;
         chainSubmit(cellKey(parentId, supervisorType), () -> {
@@ -200,9 +251,7 @@ public class Registry implements Machine.MachineRegistryHandle {
             LOG.debug("[{}] child {} already present for id={}", name, childType.getSimpleName(), parentId);
             return;
         }
-        Machine<?> child = borrowAndStart(childType, childId(parentId, childType), task);
-        if (child == null) return;
-        active.get(parentId).add(child);
+        borrowAndStart(childType, childId(parentId, childType), task);
     }
 
     void cleanupChildInternal(String parentId, Class<? extends Machine<?>> childType) {
@@ -286,6 +335,10 @@ public class Registry implements Machine.MachineRegistryHandle {
         @Override public void onMachineReachedTerminal(String mid) {
             reg.onCellTerminated(parentId, type);
         }
+        @Override public void onStateTransitioned(String mid, String newState,
+                                                   long timeoutDeadlineMs, String timeoutTargetState) {
+            reg.persistCellSnapshot(mid, type, newState, timeoutDeadlineMs, timeoutTargetState);
+        }
         @Override public void publish(StatemachineEvent event) {
             // Always routes back to this row's supervisor.
             reg.onInboundEvent(parentId, event);
@@ -293,6 +346,89 @@ public class Registry implements Machine.MachineRegistryHandle {
 
         /** Supervisor uses this to reach back into the owning Registry. */
         Registry registry() { return reg; }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Persistence + rehydration internals
+    // ─────────────────────────────────────────────────────────────────
+
+    /** Called on every successful transition via the per-machine handle. */
+    void persistCellSnapshot(String machineId, Class<? extends Machine<?>> type,
+                              String newState, long timeoutDeadlineMs,
+                              String timeoutTargetState) {
+        if (persistence == null) return;
+        // Locate the live cell to read its context.
+        String parentId = isChildId(machineId)
+            ? machineId.substring(0, machineId.indexOf(CHILD_ID_SEPARATOR))
+            : machineId;
+        Machine<?> m = findInternal(parentId, type);
+        if (m == null) return;
+        Object ctx = m.getContext();
+        try {
+            String b64 = SnapshotSerializer.contextToBase64Json(ctx);
+            String ctxClass = ctx != null ? ctx.getClass().getName() : null;
+            MachineSnapshot snap = new MachineSnapshot(
+                machineId, name, newState, ctxClass, b64,
+                System.currentTimeMillis(), timeoutTargetState, timeoutDeadlineMs);
+            persistence.save(snap);
+        } catch (RuntimeException e) {
+            LOG.warn("[{}] persistence save failed for {}: {}", name, machineId, e.toString());
+        }
+    }
+
+    /** Restore every cell with a saved snapshot for the given parentId. */
+    private int restoreAllCellsFor(String parentId) {
+        if (persistence == null || !rehydrateEnabled) return 0;
+        int restored = 0;
+        // Supervisor first (its id equals parentId).
+        if (restoreOneCell(parentId, parentId, supervisorType)) restored++;
+        // Then each child type — id is parentId#TypeName.
+        for (Class<? extends Machine<?>> t : types.keySet()) {
+            if (t == supervisorType) continue;
+            String childId = parentId + CHILD_ID_SEPARATOR + t.getSimpleName();
+            if (restoreOneCell(childId, parentId, t)) restored++;
+        }
+        if (restored > 0) {
+            LOG.info("[{}] cross-cell rehydration for id={} restored {} cells", name, parentId, restored);
+        }
+        return restored;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private boolean restoreOneCell(String machineId, String parentId,
+                                    Class<? extends Machine<?>> type) {
+        if (findInternal(parentId, type) != null) return false;     // already alive
+        var opt = persistence.load(machineId, name);
+        if (opt.isEmpty()) return false;
+        MachineSnapshot snap = opt.get();
+        TypeSpec spec = types.get(type);
+        ObjectPoolManager pool = (ObjectPoolManager) pools.get(type);
+        Machine m = (Machine) pool.borrow();
+        if (!m.isIdle()) { pool.returnObject(m); return false; }
+
+        m.setRegistry(new PerMachineHandle(this, parentId, type));
+        m.setMachineId(machineId);
+        if (spec.volatileLoader() != null) m.setVolatileContextLoader(spec.volatileLoader());
+
+        Object ctx = SnapshotSerializer.contextFromBase64Json(
+            snap.contextJsonBase64(), snap.contextClassName());
+
+        active.computeIfAbsent(parentId, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(m);
+
+        final Machine machine = m;
+        final String savedState        = snap.currentState();
+        final String savedTargetState  = snap.timeoutTargetState();
+        final long   savedDeadline     = snap.timeoutDeadlineMs();
+        chainSubmit(cellKey(parentId, type), () -> {
+            try {
+                machine.rehydrate(savedState, ctx, savedTargetState, savedDeadline);
+            } catch (Throwable t) {
+                LOG.error("[{}] rehydrate threw for {}: {} — force-cleaning",
+                    name, machineId, t.toString());
+                forceCleanupAll(parentId);
+            }
+        });
+        return true;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -320,7 +456,17 @@ public class Registry implements Machine.MachineRegistryHandle {
         String parentId = isChildId(id) ? id.substring(0, id.indexOf(CHILD_ID_SEPARATOR)) : id;
         m.setRegistry(new PerMachineHandle(this, parentId, type));
         m.setMachineId(id);
+        if (spec.volatileLoader() != null) m.setVolatileContextLoader(spec.volatileLoader());
         if (task != null) ((Machine) m).setInitialContext(task);
+
+        // Publish the machine into the active map BEFORE scheduling start(),
+        // so persistence/transition callbacks fired by start() can resolve
+        // the live cell via findInternal(). Submitting start() async with the
+        // active.add() after was a race: a fast worker could run start →
+        // onStateTransitioned → persistCellSnapshot → findInternal returns
+        // null → snapshot silently dropped.
+        active.computeIfAbsent(parentId,
+            k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(m);
 
         final Machine machine = m;
         chainSubmit(cellKey(parentId, type), () -> {
@@ -357,6 +503,19 @@ public class Registry implements Machine.MachineRegistryHandle {
             pool.returnObject(machine);
         }
         chains.remove(key);
+
+        // Drop the persisted snapshot for this cell — it has reached a final
+        // state, the framework ran the termination ritual, and the machine is
+        // back in the pool. Crash-rehydration must NOT resurrect it.
+        if (persistence != null) {
+            String cellMachineId = (type == supervisorType)
+                ? parentId
+                : parentId + CHILD_ID_SEPARATOR + type.getSimpleName();
+            try { persistence.delete(cellMachineId, name); }
+            catch (RuntimeException e) {
+                LOG.warn("[{}] persistence delete failed for {}: {}", name, cellMachineId, e.toString());
+            }
+        }
 
         // Cascade if the supervisor terminated.
         if (type == supervisorType) {
@@ -407,7 +566,11 @@ public class Registry implements Machine.MachineRegistryHandle {
     // Inner types
     // ─────────────────────────────────────────────────────────────────
 
-    record TypeSpec(Supplier<? extends Machine<?>> factory, int poolSize) {}
+    record TypeSpec(
+        Supplier<? extends Machine<?>> factory,
+        int poolSize,
+        Function<Machine<?>, Object> volatileLoader
+    ) {}
 
     // ─────────────────────────────────────────────────────────────────
     // Builder
@@ -418,6 +581,9 @@ public class Registry implements Machine.MachineRegistryHandle {
         private Class<? extends Supervisor<?>> supervisorType;
         private final Map<Class<? extends Machine<?>>, TypeSpec> types = new LinkedHashMap<>();
         private int threads = 2;
+        private PersistenceProvider persistence;
+        private boolean rehydrateEnabled;
+        private Function<StatemachineEvent, Object> firstEventToContext;
 
         Builder(String name) { this.name = name; }
 
@@ -428,7 +594,7 @@ public class Registry implements Machine.MachineRegistryHandle {
                 throw new IllegalStateException("Supervisor already declared: " + supervisorType.getName());
             }
             supervisorType = type;
-            types.put(type, new TypeSpec(factory, poolSize));
+            types.put(type, new TypeSpec(factory, poolSize, null));
             return this;
         }
 
@@ -440,17 +606,77 @@ public class Registry implements Machine.MachineRegistryHandle {
             if (types.containsKey(type)) {
                 throw new IllegalStateException("Duplicate machine type: " + type.getName());
             }
-            types.put(type, new TypeSpec(factory, poolSize));
+            types.put(type, new TypeSpec(factory, poolSize, null));
             return this;
         }
 
         public Builder threads(int n) { this.threads = n; return this; }
 
+        /**
+         * Configure persistence. With this set, every state transition of
+         * every cell is saved as a {@link MachineSnapshot} keyed by the cell's
+         * machineId (which is parentId for supervisors, parentId#TypeName for
+         * children). Terminal cells delete their snapshot.
+         */
+        public Builder persistence(PersistenceProvider provider) {
+            this.persistence = provider;
+            return this;
+        }
+
+        /**
+         * Enable rehydration on inbound events for unknown ids. When set, on
+         * the first event for an unknown id the framework probes persistence
+         * for every cell of that id (supervisor + each declared child type),
+         * restores any that have snapshots, then delivers the event.
+         *
+         * <p>Requires {@link #persistence(PersistenceProvider)}. Without it,
+         * the framework throws on an inbound non-first event for an unknown
+         * id (per the design checklist).
+         */
+        public Builder rehydrate(boolean enabled) {
+            this.rehydrateEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Per-machine-type volatile loader. Fires on both creation (in
+         * {@link Machine#start()}) and rehydration — same callback, both
+         * paths. The returned object is stored on the machine's
+         * {@code volatileContext} slot and is NOT persisted.
+         */
+        public <M extends Machine<?>> Builder volatileLoader(
+                Class<M> type, Function<Machine<?>, Object> loader) {
+            TypeSpec existing = types.get(type);
+            if (existing == null) {
+                throw new IllegalStateException(
+                    "volatileLoader: machine type not registered: " + type.getName());
+            }
+            types.put(type, new TypeSpec(existing.factory(), existing.poolSize(), loader));
+            return this;
+        }
+
+        /**
+         * Auto-create the supervisor from an inbound first event (one whose
+         * {@code isFirst()} returns true). The function receives the event
+         * and returns the supervisor's initial context. Without this hook,
+         * unknown-id inbound events are dropped (or throw, depending on
+         * rehydration config).
+         */
+        public Builder createFromFirstEvent(Function<StatemachineEvent, Object> fn) {
+            this.firstEventToContext = fn;
+            return this;
+        }
+
         public Registry build() {
             if (supervisorType == null) {
                 throw new IllegalStateException("No supervisor declared — call .supervisor(...) first");
             }
-            return new Registry(name, supervisorType, types, threads);
+            if (rehydrateEnabled && persistence == null) {
+                throw new IllegalStateException(
+                    "rehydrate(true) requires .persistence(...) — none configured");
+            }
+            return new Registry(name, supervisorType, types, threads,
+                persistence, rehydrateEnabled, firstEventToContext);
         }
     }
 }

@@ -1,12 +1,18 @@
 package com.telcobright.statewalk.v2.flat;
 
+import com.telcobright.statewalk.v2.channel.Channel;
 import com.telcobright.statewalk.v2.executor.BoundedVirtualThreadExecutor;
 import com.telcobright.statewalk.v2.machine.Machine;
 import com.telcobright.statewalk.v2.persistence.MachineSnapshot;
 import com.telcobright.statewalk.v2.persistence.PersistenceProvider;
 import com.telcobright.statewalk.v2.persistence.SnapshotSerializer;
 import com.telcobright.statewalk.v2.pool.ObjectPoolManager;
+import com.telcobright.statewalk.v2.registry.api.DispatchResult;
+import com.telcobright.statewalk.v2.registry.api.QuotaKeys;
+import com.telcobright.statewalk.v2.registry.api.QuotaLimits;
+import com.telcobright.statewalk.v2.registry.api.RejectCause;
 import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
+import com.telcobright.statewalk.v2.registry.internal.QuotaController;
 import com.telcobright.statewalk.v2.timeout.TimeoutManager;
 
 import org.slf4j.Logger;
@@ -24,6 +30,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -87,13 +94,42 @@ public class Registry implements Machine.MachineRegistryHandle {
      */
     private final Function<StatemachineEvent, Object> firstEventToContext;
 
+    /** Hard ceiling on concurrent supervisor cells; 0 disables. */
+    private final int maxConcurrent;
+
+    /** Wall-clock cap per supervisor cell; 0 disables. */
+    private final long globalTimeoutMs;
+
+    /** Terminal state for the supervisor on global-timeout fire; null disables. */
+    private final String globalTimeoutTargetState;
+
+    /** 1-in-N debug sampling for dispatched supervisors; 0 disables. */
+    private final int debugSampleRate;
+    private final AtomicLong dispatchCounter = new AtomicLong(0);
+
+    /** Per-task quota-key extractor + limit thresholds. */
+    private final Function<Object, QuotaKeys> quotaKeysExtractor;
+    private final QuotaLimits quotaLimits;
+    private final QuotaController quotaController = new QuotaController();
+    private final ConcurrentHashMap<String, QuotaKeys> dispatchQuotaKeys = new ConcurrentHashMap<>();
+
+    /** Optional protocol channel — state actions reach the wire through this. */
+    private final Channel<?, ?> channel;
+
     Registry(String name,
              Class<? extends Supervisor<?>> supervisorType,
              Map<Class<? extends Machine<?>>, TypeSpec> types,
              int threads,
              PersistenceProvider persistence,
              boolean rehydrateEnabled,
-             Function<StatemachineEvent, Object> firstEventToContext) {
+             Function<StatemachineEvent, Object> firstEventToContext,
+             int maxConcurrent,
+             long globalTimeoutMs,
+             String globalTimeoutTargetState,
+             int debugSampleRate,
+             Function<Object, QuotaKeys> quotaKeysExtractor,
+             QuotaLimits quotaLimits,
+             Channel<?, ?> channel) {
         this.name = name;
         this.supervisorType = supervisorType;
         this.types = Map.copyOf(types);
@@ -102,14 +138,29 @@ public class Registry implements Machine.MachineRegistryHandle {
         this.persistence = persistence;
         this.rehydrateEnabled = rehydrateEnabled;
         this.firstEventToContext = firstEventToContext;
+        this.maxConcurrent = Math.max(0, maxConcurrent);
+        this.globalTimeoutMs = Math.max(0, globalTimeoutMs);
+        this.globalTimeoutTargetState = globalTimeoutTargetState;
+        this.debugSampleRate = Math.max(0, debugSampleRate);
+        this.quotaKeysExtractor = quotaKeysExtractor;
+        this.quotaLimits = quotaLimits != null ? quotaLimits : QuotaLimits.UNLIMITED;
+        this.channel = channel;
 
         this.pools = new ConcurrentHashMap<>();
         types.forEach((cls, spec) -> pools.put(cls, makePool(cls, spec)));
 
-        LOG.info("[{}] flat registry initialized — supervisor={}, types={}, persistence={}, rehydrate={}",
+        LOG.info("[{}] flat registry initialized — supervisor={}, types={}, persistence={}, rehydrate={}, "
+                + "maxConcurrent={}, globalTimeoutMs={}, globalTimeoutTarget={}, debugSampleRate={}, "
+                + "quotaEnforced={}, channel={}",
             name, supervisorType.getSimpleName(), types.keySet(),
-            persistence != null, rehydrateEnabled);
+            persistence != null, rehydrateEnabled,
+            this.maxConcurrent, this.globalTimeoutMs, this.globalTimeoutTargetState,
+            this.debugSampleRate, this.quotaLimits.enforces(),
+            channel != null ? channel.getName() : "<none>");
     }
+
+    /** Exposed for state actions: the wire channel, or {@code null} if not configured. */
+    public Channel<?, ?> getChannel() { return channel; }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private ObjectPoolManager<? extends Machine<?>> makePool(
@@ -128,14 +179,76 @@ public class Registry implements Machine.MachineRegistryHandle {
     // Public API — supervisor-only surface; no child operations exposed
     // ─────────────────────────────────────────────────────────────────
 
-    /** Dispatch a new request: borrow the supervisor, set it up, start it. */
-    public void dispatch(String parentId, Object task) {
-        if (shuttingDown.get()) return;
+    /**
+     * Dispatch a new request: borrow the supervisor, run admission gates,
+     * register, schedule the global timeout, start. Returns a
+     * {@link DispatchResult} so callers can map rejections to wire-level
+     * cause codes.
+     *
+     * <p>Admission order: {@code SHUTTING_DOWN → DUPLICATE_ID → CAPACITY →
+     * QUOTA → POOL_INTEGRITY}. Each gate is cheap and short-circuits.
+     */
+    public DispatchResult dispatch(String parentId, Object task) {
+        if (shuttingDown.get()) return DispatchResult.rejected(RejectCause.SHUTTING_DOWN);
         if (active.containsKey(parentId)) {
             LOG.warn("[{}] duplicate dispatch for id={}", name, parentId);
-            return;
+            return DispatchResult.rejected(RejectCause.DUPLICATE_ID);
         }
-        borrowAndStart(supervisorType, parentId, task);
+        if (maxConcurrent > 0 && active.size() >= maxConcurrent) {
+            return DispatchResult.rejected(RejectCause.CAPACITY_EXCEEDED);
+        }
+        // Quota gate — before borrow so a reject doesn't churn the pool.
+        QuotaKeys keys = (quotaKeysExtractor != null && task != null)
+            ? quotaKeysExtractor.apply(task) : QuotaKeys.NONE;
+        if (keys == null) keys = QuotaKeys.NONE;
+        RejectCause quotaReject = quotaController.tryAcquire(keys, quotaLimits);
+        if (quotaReject != null) {
+            return DispatchResult.rejected(quotaReject);
+        }
+        Machine<?> sup = borrowAndStart(supervisorType, parentId, task);
+        if (sup == null) {
+            quotaController.release(keys);
+            return DispatchResult.rejected(RejectCause.POOL_INTEGRITY_ERROR);
+        }
+        if (keys != QuotaKeys.NONE) dispatchQuotaKeys.put(parentId, keys);
+        scheduleGlobalTimeout(parentId);
+        return DispatchResult.ok();
+    }
+
+    private void scheduleGlobalTimeout(String parentId) {
+        if (globalTimeoutMs <= 0) return;
+        timeouts.scheduleTracked(
+            "global:" + parentId,
+            () -> {
+                Machine<?> sup = supervisorOf(parentId);
+                if (sup == null || sup.isTerminated()) return;
+                LOG.info("[{}] global timeout fired id={} state={} → {}",
+                    name, parentId, sup.getCurrentState(),
+                    globalTimeoutTargetState != null
+                        ? "transition to " + globalTimeoutTargetState
+                        : "force cleanup (no target configured)");
+                if (globalTimeoutTargetState != null) {
+                    final Machine<?> machine = sup;
+                    chainSubmit(cellKey(parentId, supervisorType), () -> {
+                        try {
+                            if (!machine.isTerminated()) machine.transitionTo(globalTimeoutTargetState);
+                        } catch (Throwable t) {
+                            LOG.error("[{}] global-timeout transition threw for id={}: {} — force-cleaning",
+                                name, parentId, t.toString());
+                            forceCleanupAll(parentId);
+                        }
+                    });
+                } else {
+                    forceCleanupAll(parentId);
+                }
+            },
+            globalTimeoutMs,
+            TimeUnit.MILLISECONDS);
+    }
+
+    private void cancelGlobalTimeout(String parentId) {
+        if (globalTimeoutMs <= 0) return;
+        timeouts.cancelTracked("global:" + parentId);
     }
 
     /** Wire-inbound event arrives for {@code parentId}. Always delivered to
@@ -459,6 +572,13 @@ public class Registry implements Machine.MachineRegistryHandle {
         if (spec.volatileLoader() != null) m.setVolatileContextLoader(spec.volatileLoader());
         if (task != null) ((Machine) m).setInitialContext(task);
 
+        // 1-in-N debug sampling — only sample at the supervisor; children
+        // inherit by being part of the same logical request.
+        if (type == supervisorType && debugSampleRate > 0) {
+            boolean debug = (dispatchCounter.getAndIncrement() % debugSampleRate) == 0;
+            m.setDebugMode(debug);
+        }
+
         // Publish the machine into the active map BEFORE scheduling start(),
         // so persistence/transition callbacks fired by start() can resolve
         // the live cell via findInternal(). Submitting start() async with the
@@ -525,6 +645,11 @@ public class Registry implements Machine.MachineRegistryHandle {
                 try { onCellTerminated(parentId, sibType); } catch (RuntimeException ignored) {}
             }
             active.remove(parentId);
+            // Release quota + cancel global timeout — done once per logical
+            // request, on the supervisor's termination.
+            cancelGlobalTimeout(parentId);
+            QuotaKeys keys = dispatchQuotaKeys.remove(parentId);
+            if (keys != null) quotaController.release(keys);
         } else if (list.isEmpty()) {
             active.remove(parentId);
         }
@@ -584,6 +709,13 @@ public class Registry implements Machine.MachineRegistryHandle {
         private PersistenceProvider persistence;
         private boolean rehydrateEnabled;
         private Function<StatemachineEvent, Object> firstEventToContext;
+        private int maxConcurrent = 0;
+        private long globalTimeoutMs = 0;
+        private String globalTimeoutTargetState;
+        private int debugSampleRate = 0;
+        private Function<Object, QuotaKeys> quotaKeysExtractor;
+        private QuotaLimits quotaLimits = QuotaLimits.UNLIMITED;
+        private Channel<?, ?> channel;
 
         Builder(String name) { this.name = name; }
 
@@ -667,6 +799,56 @@ public class Registry implements Machine.MachineRegistryHandle {
             return this;
         }
 
+        /**
+         * Hard ceiling on concurrent supervisor cells. Dispatch beyond this
+         * returns {@link RejectCause#CAPACITY_EXCEEDED}. {@code 0} disables.
+         */
+        public Builder maxConcurrent(int n) { this.maxConcurrent = n; return this; }
+
+        /**
+         * Wall-clock cap on a single supervisor cell, regardless of state.
+         * On fire, transitions the supervisor to {@code targetState} (which
+         * must be a final state in the supervisor's graph); the framework
+         * then runs the standard termination ritual. {@code 0} disables.
+         */
+        public Builder globalTimeout(long duration, TimeUnit unit, String targetState) {
+            if (duration <= 0) throw new IllegalArgumentException("duration must be > 0");
+            if (targetState == null) throw new IllegalArgumentException("targetState required");
+            this.globalTimeoutMs = unit.toMillis(duration);
+            this.globalTimeoutTargetState = targetState;
+            return this;
+        }
+
+        /**
+         * 1-in-N sampling for debug-flagged supervisors. Every Nth dispatch
+         * sets {@code debugMode=true} on the supervisor; state transitions
+         * emit DEBUG-level traces. {@code 0} disables.
+         */
+        public Builder debugSampleRate(int n) { this.debugSampleRate = n; return this; }
+
+        /**
+         * Per-task quota-key extractor. The framework calls this on every
+         * dispatch with the task (which becomes the supervisor's initial
+         * context). Returned keys are checked against {@link #quotaLimits}.
+         */
+        public Builder quotaKeysExtractor(Function<Object, QuotaKeys> extractor) {
+            this.quotaKeysExtractor = extractor;
+            return this;
+        }
+
+        /** Quota thresholds enforced against the keys returned by {@link #quotaKeysExtractor}. */
+        public Builder quotaLimits(QuotaLimits limits) {
+            this.quotaLimits = limits != null ? limits : QuotaLimits.UNLIMITED;
+            return this;
+        }
+
+        /**
+         * Wire-protocol channel. State actions can reach it through
+         * {@code Registry.getChannel()} when they need to emit outbound
+         * commands.
+         */
+        public Builder channel(Channel<?, ?> channel) { this.channel = channel; return this; }
+
         public Registry build() {
             if (supervisorType == null) {
                 throw new IllegalStateException("No supervisor declared — call .supervisor(...) first");
@@ -675,8 +857,14 @@ public class Registry implements Machine.MachineRegistryHandle {
                 throw new IllegalStateException(
                     "rehydrate(true) requires .persistence(...) — none configured");
             }
+            if (quotaLimits.enforces() && quotaKeysExtractor == null) {
+                throw new IllegalStateException(
+                    "quotaLimits enforced but no quotaKeysExtractor — keys cannot be derived");
+            }
             return new Registry(name, supervisorType, types, threads,
-                persistence, rehydrateEnabled, firstEventToContext);
+                persistence, rehydrateEnabled, firstEventToContext,
+                maxConcurrent, globalTimeoutMs, globalTimeoutTargetState,
+                debugSampleRate, quotaKeysExtractor, quotaLimits, channel);
         }
     }
 }

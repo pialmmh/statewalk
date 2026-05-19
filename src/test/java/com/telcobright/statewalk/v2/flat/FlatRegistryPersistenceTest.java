@@ -133,7 +133,7 @@ class FlatRegistryPersistenceTest {
     void persistence_saves_on_every_state_transition() throws InterruptedException {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
         reg = Registry.builder("p-save")
-            .supervisor(TestSupervisor.class, TestSupervisor::new, 2)
+            .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .persistence(store)
             .threads(2)
             .build();
@@ -166,7 +166,7 @@ class FlatRegistryPersistenceTest {
     void persistence_deletes_on_cell_termination() throws InterruptedException {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
         reg = Registry.builder("p-del")
-            .supervisor(TestSupervisor.class, TestSupervisor::new, 2)
+            .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .persistence(store)
             .threads(2)
             .build();
@@ -192,8 +192,8 @@ class FlatRegistryPersistenceTest {
     void volatile_loader_fires_on_creation() throws InterruptedException {
         AtomicInteger creates = new AtomicInteger();
         reg = Registry.builder("p-vol")
-            .supervisor(TestSupervisor.class, TestSupervisor::new, 2)
-            .volatileLoader(TestSupervisor.class, m -> {
+            .supervisor("TestSupervisor", TestSupervisor::new, 2)
+            .volatileLoader("TestSupervisor", m -> {
                 creates.incrementAndGet();
                 return "vol-" + m.getMachineId();
             })
@@ -206,7 +206,7 @@ class FlatRegistryPersistenceTest {
 
         assertEquals(2, creates.get(), "loader fires once per machine creation");
 
-        Machine<?> a = reg.findInternal("uuid-vol-a", TestSupervisor.class);
+        Machine<?> a = reg.findInternal("uuid-vol-a", "TestSupervisor");
         assertNotNull(a);
         assertEquals("vol-uuid-vol-a", a.getVolatileContext());
     }
@@ -236,10 +236,10 @@ class FlatRegistryPersistenceTest {
 
         AtomicInteger loads = new AtomicInteger();
         reg = Registry.builder("p-vol-rehy")
-            .supervisor(TestSupervisor.class, TestSupervisor::new, 2)
+            .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .persistence(store)
             .rehydrate(true)
-            .volatileLoader(TestSupervisor.class, m -> {
+            .volatileLoader("TestSupervisor", m -> {
                 loads.incrementAndGet();
                 return "rehydrated-vol";
             })
@@ -251,7 +251,7 @@ class FlatRegistryPersistenceTest {
         assertTrue(reg.awaitIdle(3, TimeUnit.SECONDS));
 
         assertEquals(1, loads.get(), "volatile loader fired during rehydration");
-        Machine<?> sup = reg.findInternal(id, TestSupervisor.class);
+        Machine<?> sup = reg.findInternal(id, "TestSupervisor");
         assertNotNull(sup, "supervisor restored from snapshot");
         assertEquals("rehydrated-vol", sup.getVolatileContext());
     }
@@ -283,8 +283,8 @@ class FlatRegistryPersistenceTest {
             now, "DONE", now + 60_000L));
 
         reg = Registry.builder("p-multi")
-            .supervisor(TestSupervisor.class, TestSupervisor::new, 2)
-            .child(TestChild.class, TestChild::new, 2)
+            .supervisor("TestSupervisor", TestSupervisor::new, 2)
+            .child("TestChild", TestChild::new, 2)
             .persistence(store)
             .rehydrate(true)
             .threads(2)
@@ -295,8 +295,8 @@ class FlatRegistryPersistenceTest {
         assertTrue(reg.awaitIdle(3, TimeUnit.SECONDS));
 
         assertEquals(2, reg.activeCellCount(), "supervisor + child restored");
-        Machine<?> sup = reg.findInternal(id, TestSupervisor.class);
-        Machine<?> child = reg.findInternal(id, TestChild.class);
+        Machine<?> sup = reg.findInternal(id, "TestSupervisor");
+        Machine<?> child = reg.findInternal(id, "TestChild");
         assertNotNull(sup);
         assertNotNull(child);
         TestCtx supCtxRestored = (TestCtx) sup.getContext();
@@ -312,7 +312,7 @@ class FlatRegistryPersistenceTest {
     @Test
     void first_event_auto_creates_supervisor() throws InterruptedException {
         reg = Registry.builder("p-first")
-            .supervisor(TestSupervisor.class, TestSupervisor::new, 2)
+            .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .createFromFirstEvent(ev -> {
                 if (ev instanceof InitCall init) {
                     TestCtx c = new TestCtx();
@@ -329,7 +329,7 @@ class FlatRegistryPersistenceTest {
         reg.onInboundEvent(id, new InitCall(id, "777"));
         assertTrue(reg.awaitIdle(2, TimeUnit.SECONDS));
 
-        Machine<?> sup = reg.findInternal(id, TestSupervisor.class);
+        Machine<?> sup = reg.findInternal(id, "TestSupervisor");
         assertNotNull(sup, "supervisor auto-created from first event");
         TestCtx ctx = (TestCtx) sup.getContext();
         assertEquals("777", ctx.caller, "hook populated context from event");
@@ -342,7 +342,7 @@ class FlatRegistryPersistenceTest {
     @Test
     void unknown_id_non_first_event_throws() {
         reg = Registry.builder("p-throw")
-            .supervisor(TestSupervisor.class, TestSupervisor::new, 2)
+            .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .threads(2)
             .build();
 

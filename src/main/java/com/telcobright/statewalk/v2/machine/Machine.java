@@ -65,6 +65,7 @@ public abstract class Machine<C> implements Poolable {
     /** Bound by the registry on borrow; cleared on reset. */
     private MachineRegistryHandle registry;
     private String machineId;
+    private String typeName;
     private C context;
 
     /**
@@ -152,6 +153,14 @@ public abstract class Machine<C> implements Poolable {
     public final void setMachineId(String id) {
         this.machineId = id;
     }
+
+    /** @hidden Set by the registry on borrow — names the machine's type within the registry. */
+    public final void setTypeName(String name) {
+        this.typeName = name;
+    }
+
+    /** Machine's type name within its registry — e.g. {@code "CallSupervisor"}, {@code "CallSignaling"}. */
+    public final String getTypeName() { return typeName; }
 
     /**
      * @hidden Seat the initial context. Called by the registry on dispatch
@@ -546,6 +555,7 @@ public abstract class Machine<C> implements Poolable {
 
         registry = null;
         machineId = null;
+        typeName = null;
         context = null;
         volatileContext = null;
         volatileLoader = null;

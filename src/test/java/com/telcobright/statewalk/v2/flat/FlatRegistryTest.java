@@ -110,11 +110,11 @@ class FlatRegistryTest {
             r.selfHandle(SignalingProgress.class);
 
             // single-target forwarding
-            r.forwardTo(SignalingMachine.class, CallRinging.class);
-            r.forwardTo(BalanceMachine.class,   SettleNow.class);
+            r.forwardTo("SignalingMachine", CallRinging.class);
+            r.forwardTo("BalanceMachine",   SettleNow.class);
 
             // fan-out: deliver to BOTH children
-            r.forwardToAll(List.of(SignalingMachine.class, BalanceMachine.class),
+            r.forwardToAll(List.of("SignalingMachine", "BalanceMachine"),
                 FanoutPing.class);
 
             // explicit drop (silence WARN)
@@ -130,8 +130,8 @@ class FlatRegistryTest {
                     .timeout(5, TimeUnit.SECONDS, "DONE")
                     .onEntry(self -> {
                         CallSupervisor s = (CallSupervisor) self;
-                        s.resolver.spawnChild(SignalingMachine.class, null);
-                        s.resolver.spawnChild(BalanceMachine.class, null);
+                        s.resolver.spawnChild("SignalingMachine", null);
+                        s.resolver.spawnChild("BalanceMachine", null);
                     })
                     .on(SignalingProgress.class, "RANG")
                     .on(StartCall.class, "ACTIVE")
@@ -159,9 +159,9 @@ class FlatRegistryTest {
 
     private Registry build() {
         return Registry.builder("call")
-            .supervisor(CallSupervisor.class, CallSupervisor::new, 4)
-            .child(SignalingMachine.class,    SignalingMachine::new, 4)
-            .child(BalanceMachine.class,      BalanceMachine::new,   4)
+            .supervisor("CallSupervisor", CallSupervisor::new, 4)
+            .child("SignalingMachine",    SignalingMachine::new, 4)
+            .child("BalanceMachine",      BalanceMachine::new,   4)
             .threads(2)
             .build();
     }
@@ -188,7 +188,7 @@ class FlatRegistryTest {
         // We can't introspect supervisor context easily; instead check that
         // SignalingProgress traversed: signaling reached RANG → supervisor's
         // SupCtx.rang should be 1.
-        var supMach = (CallSupervisor) reg.findInternal(uuid, CallSupervisor.class);
+        var supMach = (CallSupervisor) reg.findInternal(uuid, "CallSupervisor");
         assertNotNull(supMach, "supervisor still alive");
         assertEquals(1, supMach.getContext().rang,
             "child publish reached supervisor and self-handle fired");

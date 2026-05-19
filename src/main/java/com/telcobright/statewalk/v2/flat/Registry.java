@@ -44,25 +44,28 @@ import java.util.function.Supplier;
  * child manipulation is package-private and reachable only through
  * {@link InternalEventResolver}, which lives on the supervisor instance.
  *
+ * <h2>Type identity</h2>
+ * Every machine type (supervisor and each child) is identified by a
+ * {@code String name} declared at registration time (in a
+ * {@link SupervisorSpec}, {@link MachineSpec}, or via a raw-factory builder
+ * call). Pools, routes, cell ids and persistence keys all use this name.
+ * <strong>One Java class can back many distinct registered names</strong> —
+ * the framework runs a generic {@link SpecBackedMachine} /
+ * {@link SpecBackedSupervisor} for spec-based registrations.
+ *
  * <h2>Data structure</h2>
  * <pre>
  *   active  = Map&lt;parentId, List&lt;Machine&gt;&gt;          // machines[0] = supervisor
- *   pools   = Map&lt;Class, ObjectPoolManager&gt;          // per-type pools
- *   chains  = Map&lt;"parentId#TypeName", CFuture&gt;      // per-instance FIFO
+ *   pools   = Map&lt;typeName, ObjectPoolManager&gt;       // per-type pools
+ *   chains  = Map&lt;"parentId#typeName", CFuture&gt;      // per-cell FIFO
  * </pre>
  *
  * <h2>Machine ids</h2>
  * <ul>
  *   <li>Supervisor: {@code parentId} (the wire UUID).</li>
- *   <li>Child: {@code parentId + "#" + TypeName} (e.g. {@code call-1#CallSignaling}).</li>
+ *   <li>Child: {@code parentId + "#" + typeName} (e.g. {@code call-1#CallSignaling}).</li>
  * </ul>
  * Stable, debuggable, friendly to persistence (single-column key).
- *
- * <h2>What gets shared</h2>
- * All lifecycle subsystems — pools, FIFO chains, executor, timeout manager —
- * are owned by this Registry once and used across every machine type it
- * hosts. A bug fix here automatically benefits every domain that extends
- * this base.
  */
 public class Registry implements Machine.MachineRegistryHandle {
 
@@ -71,9 +74,9 @@ public class Registry implements Machine.MachineRegistryHandle {
     public static final String CHILD_ID_SEPARATOR = "#";
 
     private final String name;
-    private final Class<? extends Supervisor<?>> supervisorType;
-    private final Map<Class<? extends Machine<?>>, TypeSpec> types;
-    private final Map<Class<? extends Machine<?>>, ObjectPoolManager<? extends Machine<?>>> pools;
+    private final String supervisorName;
+    private final Map<String, RegistryType> types;                           // typeName → type registration
+    private final Map<String, ObjectPoolManager<? extends Machine<?>>> pools; // typeName → pool
 
     private final ConcurrentHashMap<String, List<Machine<?>>> active = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<Void>> chains = new ConcurrentHashMap<>();
@@ -117,8 +120,8 @@ public class Registry implements Machine.MachineRegistryHandle {
     private final Channel<?, ?> channel;
 
     Registry(String name,
-             Class<? extends Supervisor<?>> supervisorType,
-             Map<Class<? extends Machine<?>>, TypeSpec> types,
+             String supervisorName,
+             Map<String, RegistryType> types,
              int threads,
              PersistenceProvider persistence,
              boolean rehydrateEnabled,
@@ -131,7 +134,7 @@ public class Registry implements Machine.MachineRegistryHandle {
              QuotaLimits quotaLimits,
              Channel<?, ?> channel) {
         this.name = name;
-        this.supervisorType = supervisorType;
+        this.supervisorName = supervisorName;
         this.types = Map.copyOf(types);
         this.timeouts = new TimeoutManager(name, Math.max(2, threads));
         this.work = new BoundedVirtualThreadExecutor(name, Math.max(16, types.size() * 100));
@@ -147,12 +150,12 @@ public class Registry implements Machine.MachineRegistryHandle {
         this.channel = channel;
 
         this.pools = new ConcurrentHashMap<>();
-        types.forEach((cls, spec) -> pools.put(cls, makePool(cls, spec)));
+        types.forEach((n, t) -> pools.put(n, makePool(n, t)));
 
         LOG.info("[{}] flat registry initialized — supervisor={}, types={}, persistence={}, rehydrate={}, "
                 + "maxConcurrent={}, globalTimeoutMs={}, globalTimeoutTarget={}, debugSampleRate={}, "
                 + "quotaEnforced={}, channel={}",
-            name, supervisorType.getSimpleName(), types.keySet(),
+            name, supervisorName, types.keySet(),
             persistence != null, rehydrateEnabled,
             this.maxConcurrent, this.globalTimeoutMs, this.globalTimeoutTargetState,
             this.debugSampleRate, this.quotaLimits.enforces(),
@@ -163,12 +166,11 @@ public class Registry implements Machine.MachineRegistryHandle {
     public Channel<?, ?> getChannel() { return channel; }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private ObjectPoolManager<? extends Machine<?>> makePool(
-            Class<? extends Machine<?>> cls, TypeSpec spec) {
+    private ObjectPoolManager<? extends Machine<?>> makePool(String typeName, RegistryType t) {
         return new ObjectPoolManager(
-            name + "-" + cls.getSimpleName(),
-            (Supplier) spec.factory(),
-            spec.poolSize());
+            name + "-" + typeName,
+            (Supplier) t.factory(),
+            t.poolSize());
     }
 
     public static Builder builder(String name) { return new Builder(name); }
@@ -205,7 +207,7 @@ public class Registry implements Machine.MachineRegistryHandle {
         if (quotaReject != null) {
             return DispatchResult.rejected(quotaReject);
         }
-        Machine<?> sup = borrowAndStart(supervisorType, parentId, task);
+        Machine<?> sup = borrowAndStart(supervisorName, parentId, task);
         if (sup == null) {
             quotaController.release(keys);
             return DispatchResult.rejected(RejectCause.POOL_INTEGRITY_ERROR);
@@ -229,7 +231,7 @@ public class Registry implements Machine.MachineRegistryHandle {
                         : "force cleanup (no target configured)");
                 if (globalTimeoutTargetState != null) {
                     final Machine<?> machine = sup;
-                    chainSubmit(cellKey(parentId, supervisorType), () -> {
+                    chainSubmit(cellKey(parentId, supervisorName), () -> {
                         try {
                             if (!machine.isTerminated()) machine.transitionTo(globalTimeoutTargetState);
                         } catch (Throwable t) {
@@ -275,7 +277,6 @@ public class Registry implements Machine.MachineRegistryHandle {
                 Object initialCtx = firstEventToContext.apply(event);
                 if (initialCtx != null) {
                     dispatch(parentId, initialCtx);
-                    // Re-resolve supervisor now that it's been spawned.
                     sup = supervisorOf(parentId);
                 }
             }
@@ -285,7 +286,6 @@ public class Registry implements Machine.MachineRegistryHandle {
                 if (restored > 0) sup = supervisorOf(parentId);
             }
             if (sup == null) {
-                // Per checklist: throw when no recovery path exists.
                 throw new IllegalStateException(
                     "[" + name + "] no supervisor for id=" + parentId
                     + " and event " + event.getClass().getSimpleName()
@@ -294,7 +294,7 @@ public class Registry implements Machine.MachineRegistryHandle {
             }
         }
         Supervisor<?> supervisor = (Supervisor<?>) sup;
-        chainSubmit(cellKey(parentId, supervisorType), () -> {
+        chainSubmit(cellKey(parentId, supervisorName), () -> {
             try { supervisor.handleInbound(event); }
             catch (Throwable t) {
                 LOG.warn("[{}] supervisor.handleInbound threw for id={}: {}",
@@ -315,8 +315,6 @@ public class Registry implements Machine.MachineRegistryHandle {
 
     public boolean awaitIdle(long timeout, TimeUnit unit) throws InterruptedException {
         long deadlineNs = System.nanoTime() + unit.toNanos(timeout);
-        // Loop until quiescent — child publishes feed the supervisor's chain
-        // and vice versa, so a single drain pass can leave new work pending.
         int prev = -1; int stable = 0;
         for (int pass = 0; pass < 20; pass++) {
             for (var f : new ArrayList<>(chains.values())) {
@@ -351,56 +349,56 @@ public class Registry implements Machine.MachineRegistryHandle {
     // Package-private — InternalEventResolver is the ONLY caller
     // ─────────────────────────────────────────────────────────────────
 
-    void spawnChildInternal(String parentId, Class<? extends Machine<?>> childType, Object task) {
+    void spawnChildInternal(String parentId, String childTypeName, Object task) {
         if (shuttingDown.get()) return;
-        if (childType == supervisorType) {
+        if (childTypeName.equals(supervisorName)) {
             throw new IllegalArgumentException("Cannot spawn supervisor as a child");
         }
-        if (!types.containsKey(childType)) {
-            throw new IllegalArgumentException("Unknown machine type: " + childType.getName());
+        if (!types.containsKey(childTypeName)) {
+            throw new IllegalArgumentException("Unknown machine type: " + childTypeName);
         }
-        Machine<?> existing = findChildInternal(parentId, childType);
+        Machine<?> existing = findChildInternal(parentId, childTypeName);
         if (existing != null) {
-            LOG.debug("[{}] child {} already present for id={}", name, childType.getSimpleName(), parentId);
+            LOG.debug("[{}] child {} already present for id={}", name, childTypeName, parentId);
             return;
         }
-        borrowAndStart(childType, childId(parentId, childType), task);
+        borrowAndStart(childTypeName, childId(parentId, childTypeName), task);
     }
 
-    void cleanupChildInternal(String parentId, Class<? extends Machine<?>> childType) {
-        Machine<?> child = findChildInternal(parentId, childType);
+    void cleanupChildInternal(String parentId, String childTypeName) {
+        Machine<?> child = findChildInternal(parentId, childTypeName);
         if (child == null) return;
-        onCellTerminated(parentId, childType);
+        onCellTerminated(parentId, childTypeName);
     }
 
-    void forwardToChild(String parentId, Class<? extends Machine<?>> childType,
+    void forwardToChild(String parentId, String childTypeName,
                         StatemachineEvent event) {
-        Machine<?> child = findChildInternal(parentId, childType);
+        Machine<?> child = findChildInternal(parentId, childTypeName);
         if (child == null) {
             LOG.debug("[{}] no {} for id={}, drop {}",
-                name, childType.getSimpleName(), parentId, event.getClass().getSimpleName());
+                name, childTypeName, parentId, event.getClass().getSimpleName());
             return;
         }
         final Machine<?> m = child;
-        chainSubmit(cellKey(parentId, childType), () -> {
+        chainSubmit(cellKey(parentId, childTypeName), () -> {
             try { m.fire(event); }
             catch (Throwable t) {
                 LOG.warn("[{}] child fire threw for id={}/{}: {}",
-                    name, parentId, childType.getSimpleName(), t.toString());
+                    name, parentId, childTypeName, t.toString());
             }
         });
     }
 
-    Machine<?> findChildInternal(String parentId, Class<? extends Machine<?>> childType) {
-        return findInternal(parentId, childType);
+    Machine<?> findChildInternal(String parentId, String childTypeName) {
+        return findInternal(parentId, childTypeName);
     }
 
     /** Package-private introspection — any machine type in the row, supervisor included. */
-    Machine<?> findInternal(String parentId, Class<? extends Machine<?>> type) {
+    Machine<?> findInternal(String parentId, String typeName) {
         List<Machine<?>> list = active.get(parentId);
         if (list == null) return null;
         for (Machine<?> m : list) {
-            if (m.getClass() == type) return m;
+            if (typeName.equals(m.getTypeName())) return m;
         }
         return null;
     }
@@ -409,7 +407,7 @@ public class Registry implements Machine.MachineRegistryHandle {
         List<Machine<?>> list = active.get(parentId);
         if (list == null) return;
         for (Machine<?> m : new ArrayList<>(list)) {
-            try { onCellTerminated(parentId, (Class<? extends Machine<?>>) m.getClass()); }
+            try { onCellTerminated(parentId, m.getTypeName()); }
             catch (RuntimeException ignored) {}
         }
     }
@@ -434,26 +432,25 @@ public class Registry implements Machine.MachineRegistryHandle {
         // No-op at this level; per-machine handle dispatches to publishFrom.
     }
 
-    /** Per-machine handle — knows its parentId + type so callbacks have context. */
+    /** Per-machine handle — knows its parentId + typeName so callbacks have context. */
     static final class PerMachineHandle implements Machine.MachineRegistryHandle {
         final Registry reg;
         final String parentId;
-        final Class<? extends Machine<?>> type;
-        PerMachineHandle(Registry reg, String parentId, Class<? extends Machine<?>> type) {
-            this.reg = reg; this.parentId = parentId; this.type = type;
+        final String typeName;
+        PerMachineHandle(Registry reg, String parentId, String typeName) {
+            this.reg = reg; this.parentId = parentId; this.typeName = typeName;
         }
         @Override public ScheduledFuture<?> schedule(String mid, Runnable r, long d, TimeUnit u) {
             return reg.timeouts.schedule(r, d, u);
         }
         @Override public void onMachineReachedTerminal(String mid) {
-            reg.onCellTerminated(parentId, type);
+            reg.onCellTerminated(parentId, typeName);
         }
         @Override public void onStateTransitioned(String mid, String newState,
                                                    long timeoutDeadlineMs, String timeoutTargetState) {
-            reg.persistCellSnapshot(mid, type, newState, timeoutDeadlineMs, timeoutTargetState);
+            reg.persistCellSnapshot(mid, typeName, newState, timeoutDeadlineMs, timeoutTargetState);
         }
         @Override public void publish(StatemachineEvent event) {
-            // Always routes back to this row's supervisor.
             reg.onInboundEvent(parentId, event);
         }
 
@@ -466,15 +463,14 @@ public class Registry implements Machine.MachineRegistryHandle {
     // ─────────────────────────────────────────────────────────────────
 
     /** Called on every successful transition via the per-machine handle. */
-    void persistCellSnapshot(String machineId, Class<? extends Machine<?>> type,
+    void persistCellSnapshot(String machineId, String typeName,
                               String newState, long timeoutDeadlineMs,
                               String timeoutTargetState) {
         if (persistence == null) return;
-        // Locate the live cell to read its context.
         String parentId = isChildId(machineId)
             ? machineId.substring(0, machineId.indexOf(CHILD_ID_SEPARATOR))
             : machineId;
-        Machine<?> m = findInternal(parentId, type);
+        Machine<?> m = findInternal(parentId, typeName);
         if (m == null) return;
         Object ctx = m.getContext();
         try {
@@ -493,12 +489,10 @@ public class Registry implements Machine.MachineRegistryHandle {
     private int restoreAllCellsFor(String parentId) {
         if (persistence == null || !rehydrateEnabled) return 0;
         int restored = 0;
-        // Supervisor first (its id equals parentId).
-        if (restoreOneCell(parentId, parentId, supervisorType)) restored++;
-        // Then each child type — id is parentId#TypeName.
-        for (Class<? extends Machine<?>> t : types.keySet()) {
-            if (t == supervisorType) continue;
-            String childId = parentId + CHILD_ID_SEPARATOR + t.getSimpleName();
+        if (restoreOneCell(parentId, parentId, supervisorName)) restored++;
+        for (String t : types.keySet()) {
+            if (t.equals(supervisorName)) continue;
+            String childId = parentId + CHILD_ID_SEPARATOR + t;
             if (restoreOneCell(childId, parentId, t)) restored++;
         }
         if (restored > 0) {
@@ -508,20 +502,20 @@ public class Registry implements Machine.MachineRegistryHandle {
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private boolean restoreOneCell(String machineId, String parentId,
-                                    Class<? extends Machine<?>> type) {
-        if (findInternal(parentId, type) != null) return false;     // already alive
+    private boolean restoreOneCell(String machineId, String parentId, String typeName) {
+        if (findInternal(parentId, typeName) != null) return false;     // already alive
         var opt = persistence.load(machineId, name);
         if (opt.isEmpty()) return false;
         MachineSnapshot snap = opt.get();
-        TypeSpec spec = types.get(type);
-        ObjectPoolManager pool = (ObjectPoolManager) pools.get(type);
+        RegistryType t = types.get(typeName);
+        ObjectPoolManager pool = (ObjectPoolManager) pools.get(typeName);
         Machine m = (Machine) pool.borrow();
         if (!m.isIdle()) { pool.returnObject(m); return false; }
 
-        m.setRegistry(new PerMachineHandle(this, parentId, type));
+        m.setRegistry(new PerMachineHandle(this, parentId, typeName));
         m.setMachineId(machineId);
-        if (spec.volatileLoader() != null) m.setVolatileContextLoader(spec.volatileLoader());
+        m.setTypeName(typeName);
+        if (t.volatileLoader() != null) m.setVolatileContextLoader(t.volatileLoader());
 
         Object ctx = SnapshotSerializer.contextFromBase64Json(
             snap.contextJsonBase64(), snap.contextClassName());
@@ -532,12 +526,12 @@ public class Registry implements Machine.MachineRegistryHandle {
         final String savedState        = snap.currentState();
         final String savedTargetState  = snap.timeoutTargetState();
         final long   savedDeadline     = snap.timeoutDeadlineMs();
-        chainSubmit(cellKey(parentId, type), () -> {
+        chainSubmit(cellKey(parentId, typeName), () -> {
             try {
                 machine.rehydrate(savedState, ctx, savedTargetState, savedDeadline);
-            } catch (Throwable t) {
+            } catch (Throwable t2) {
                 LOG.error("[{}] rehydrate threw for {}: {} — force-cleaning",
-                    name, machineId, t.toString());
+                    name, machineId, t2.toString());
                 forceCleanupAll(parentId);
             }
         });
@@ -549,66 +543,62 @@ public class Registry implements Machine.MachineRegistryHandle {
     // ─────────────────────────────────────────────────────────────────
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private Machine<?> borrowAndStart(
-            Class<? extends Machine<?>> type, String id, Object task) {
-        TypeSpec spec = types.get(type);
-        if (spec == null) {
-            LOG.error("[{}] unknown machine type {}", name, type.getName());
+    private Machine<?> borrowAndStart(String typeName, String id, Object task) {
+        RegistryType t = types.get(typeName);
+        if (t == null) {
+            LOG.error("[{}] unknown machine type {}", name, typeName);
             return null;
         }
-        ObjectPoolManager pool = (ObjectPoolManager) pools.get(type);
+        ObjectPoolManager pool = (ObjectPoolManager) pools.get(typeName);
         Machine m = (Machine) pool.borrow();
         if (!m.isIdle()) {
             pool.returnObject(m);
             m = (Machine) pool.borrow();
             if (!m.isIdle()) {
-                LOG.error("[{}] pool integrity error for {}", name, type.getSimpleName());
+                LOG.error("[{}] pool integrity error for {}", name, typeName);
                 return null;
             }
         }
         String parentId = isChildId(id) ? id.substring(0, id.indexOf(CHILD_ID_SEPARATOR)) : id;
-        m.setRegistry(new PerMachineHandle(this, parentId, type));
+        m.setRegistry(new PerMachineHandle(this, parentId, typeName));
         m.setMachineId(id);
-        if (spec.volatileLoader() != null) m.setVolatileContextLoader(spec.volatileLoader());
+        m.setTypeName(typeName);
+        if (t.volatileLoader() != null) m.setVolatileContextLoader(t.volatileLoader());
         if (task != null) ((Machine) m).setInitialContext(task);
 
         // 1-in-N debug sampling — only sample at the supervisor; children
         // inherit by being part of the same logical request.
-        if (type == supervisorType && debugSampleRate > 0) {
+        if (typeName.equals(supervisorName) && debugSampleRate > 0) {
             boolean debug = (dispatchCounter.getAndIncrement() % debugSampleRate) == 0;
             m.setDebugMode(debug);
         }
 
-        // Publish the machine into the active map BEFORE scheduling start(),
-        // so persistence/transition callbacks fired by start() can resolve
-        // the live cell via findInternal(). Submitting start() async with the
-        // active.add() after was a race: a fast worker could run start →
-        // onStateTransitioned → persistCellSnapshot → findInternal returns
-        // null → snapshot silently dropped.
+        // Publish into active BEFORE scheduling start() so persistence /
+        // transition callbacks fired by start() resolve the live cell.
         active.computeIfAbsent(parentId,
             k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(m);
 
         final Machine machine = m;
-        chainSubmit(cellKey(parentId, type), () -> {
+        chainSubmit(cellKey(parentId, typeName), () -> {
             try { machine.start(); }
-            catch (Throwable t) {
+            catch (Throwable t2) {
                 LOG.error("[{}] start threw for {}/{}: {} — force-cleaning",
-                    name, parentId, type.getSimpleName(), t.toString());
+                    name, parentId, typeName, t2.toString());
                 forceCleanupAll(parentId);
             }
         });
         return m;
     }
 
-    private void onCellTerminated(String parentId, Class<? extends Machine<?>> type) {
-        String key = cellKey(parentId, type);
+    private void onCellTerminated(String parentId, String typeName) {
+        String key = cellKey(parentId, typeName);
         if (!terminated.add(key)) return;
 
         List<Machine<?>> list = active.get(parentId);
         if (list == null) { terminated.remove(key); return; }
         Machine<?> machine = null;
         for (Machine<?> m : list) {
-            if (m.getClass() == type) { machine = m; break; }
+            if (typeName.equals(m.getTypeName())) { machine = m; break; }
         }
         if (machine == null) { terminated.remove(key); return; }
         list.remove(machine);
@@ -619,7 +609,7 @@ public class Registry implements Machine.MachineRegistryHandle {
         }
         if (machine.isIdle()) {
             @SuppressWarnings({"unchecked", "rawtypes"})
-            ObjectPoolManager pool = (ObjectPoolManager) pools.get(type);
+            ObjectPoolManager pool = (ObjectPoolManager) pools.get(typeName);
             pool.returnObject(machine);
         }
         chains.remove(key);
@@ -628,9 +618,9 @@ public class Registry implements Machine.MachineRegistryHandle {
         // state, the framework ran the termination ritual, and the machine is
         // back in the pool. Crash-rehydration must NOT resurrect it.
         if (persistence != null) {
-            String cellMachineId = (type == supervisorType)
+            String cellMachineId = typeName.equals(supervisorName)
                 ? parentId
-                : parentId + CHILD_ID_SEPARATOR + type.getSimpleName();
+                : parentId + CHILD_ID_SEPARATOR + typeName;
             try { persistence.delete(cellMachineId, name); }
             catch (RuntimeException e) {
                 LOG.warn("[{}] persistence delete failed for {}: {}", name, cellMachineId, e.toString());
@@ -638,15 +628,12 @@ public class Registry implements Machine.MachineRegistryHandle {
         }
 
         // Cascade if the supervisor terminated.
-        if (type == supervisorType) {
+        if (typeName.equals(supervisorName)) {
             for (Machine<?> sibling : new ArrayList<>(list)) {
-                @SuppressWarnings("unchecked")
-                Class<? extends Machine<?>> sibType = (Class<? extends Machine<?>>) sibling.getClass();
+                String sibType = sibling.getTypeName();
                 try { onCellTerminated(parentId, sibType); } catch (RuntimeException ignored) {}
             }
             active.remove(parentId);
-            // Release quota + cancel global timeout — done once per logical
-            // request, on the supervisor's termination.
             cancelGlobalTimeout(parentId);
             QuotaKeys keys = dispatchQuotaKeys.remove(parentId);
             if (keys != null) quotaController.release(keys);
@@ -661,7 +648,7 @@ public class Registry implements Machine.MachineRegistryHandle {
         List<Machine<?>> list = active.get(parentId);
         if (list == null || list.isEmpty()) return null;
         Machine<?> first = list.get(0);
-        return first.getClass() == supervisorType ? first : null;
+        return supervisorName.equals(first.getTypeName()) ? first : null;
     }
 
     private void chainSubmit(String chainKey, Runnable task) {
@@ -677,12 +664,12 @@ public class Registry implements Machine.MachineRegistryHandle {
         });
     }
 
-    private static String cellKey(String parentId, Class<? extends Machine<?>> type) {
-        return parentId + CHILD_ID_SEPARATOR + type.getSimpleName();
+    private static String cellKey(String parentId, String typeName) {
+        return parentId + CHILD_ID_SEPARATOR + typeName;
     }
 
-    private static String childId(String parentId, Class<? extends Machine<?>> childType) {
-        return parentId + CHILD_ID_SEPARATOR + childType.getSimpleName();
+    private static String childId(String parentId, String childTypeName) {
+        return parentId + CHILD_ID_SEPARATOR + childTypeName;
     }
 
     private static boolean isChildId(String id) { return id.contains(CHILD_ID_SEPARATOR); }
@@ -691,7 +678,8 @@ public class Registry implements Machine.MachineRegistryHandle {
     // Inner types
     // ─────────────────────────────────────────────────────────────────
 
-    record TypeSpec(
+    /** Per-type registration: factory + pool size + optional volatile loader. */
+    record RegistryType(
         Supplier<? extends Machine<?>> factory,
         int poolSize,
         Function<Machine<?>, Object> volatileLoader
@@ -703,8 +691,8 @@ public class Registry implements Machine.MachineRegistryHandle {
 
     public static final class Builder {
         private final String name;
-        private Class<? extends Supervisor<?>> supervisorType;
-        private final Map<Class<? extends Machine<?>>, TypeSpec> types = new LinkedHashMap<>();
+        private String supervisorName;
+        private final Map<String, RegistryType> types = new LinkedHashMap<>();
         private int threads = 2;
         private PersistenceProvider persistence;
         private boolean rehydrateEnabled;
@@ -719,98 +707,99 @@ public class Registry implements Machine.MachineRegistryHandle {
 
         Builder(String name) { this.name = name; }
 
-        /** First machine declared MUST be a Supervisor — it's machines[0] of every row. */
-        public <S extends Supervisor<?>> Builder supervisor(
-                Class<S> type, Supplier<S> factory, int poolSize) {
-            if (supervisorType != null) {
-                throw new IllegalStateException("Supervisor already declared: " + supervisorType.getName());
-            }
-            supervisorType = type;
-            types.put(type, new TypeSpec(factory, poolSize, null));
+        // ── Spec-based registration (primary API) ─────────────────────
+
+        /** Register the supervisor via a {@link SupervisorSpec}. */
+        public <C> Builder supervisor(SupervisorSpec<C> spec, int poolSize) {
+            requireUnique(spec.name());
+            this.supervisorName = spec.name();
+            this.types.put(spec.name(),
+                new RegistryType(() -> new SpecBackedSupervisor<>(spec), poolSize, null));
             return this;
         }
 
-        public <M extends Machine<?>> Builder child(
-                Class<M> type, Supplier<M> factory, int poolSize) {
-            if (supervisorType == null) {
+        /** Register a child machine type via a {@link MachineSpec}. */
+        public <C> Builder child(MachineSpec<C> spec, int poolSize) {
+            requireSupervisorFirst();
+            requireUnique(spec.name());
+            this.types.put(spec.name(),
+                new RegistryType(() -> new SpecBackedMachine<>(spec), poolSize, null));
+            return this;
+        }
+
+        // ── Raw-factory registration (for custom subclasses / tests) ──
+
+        /**
+         * Register the supervisor with a raw factory + name. Use when a custom
+         * {@code Supervisor} subclass is needed (otherwise prefer {@link #supervisor(SupervisorSpec, int)}).
+         */
+        public Builder supervisor(String typeName, Supplier<? extends Supervisor<?>> factory, int poolSize) {
+            requireUnique(typeName);
+            this.supervisorName = typeName;
+            this.types.put(typeName, new RegistryType(factory, poolSize, null));
+            return this;
+        }
+
+        /**
+         * Register a child machine type with a raw factory + name. Use when a
+         * custom {@code Machine} subclass is needed (otherwise prefer
+         * {@link #child(MachineSpec, int)}).
+         */
+        public Builder child(String typeName, Supplier<? extends Machine<?>> factory, int poolSize) {
+            requireSupervisorFirst();
+            requireUnique(typeName);
+            this.types.put(typeName, new RegistryType(factory, poolSize, null));
+            return this;
+        }
+
+        private void requireSupervisorFirst() {
+            if (supervisorName == null) {
                 throw new IllegalStateException("Declare .supervisor(...) before .child(...)");
             }
-            if (types.containsKey(type)) {
-                throw new IllegalStateException("Duplicate machine type: " + type.getName());
+        }
+
+        private void requireUnique(String typeName) {
+            if (typeName == null || typeName.isBlank()) {
+                throw new IllegalArgumentException("typeName must be non-blank");
             }
-            types.put(type, new TypeSpec(factory, poolSize, null));
-            return this;
+            if (types.containsKey(typeName)) {
+                throw new IllegalStateException("Duplicate machine type name: " + typeName);
+            }
         }
 
         public Builder threads(int n) { this.threads = n; return this; }
 
-        /**
-         * Configure persistence. With this set, every state transition of
-         * every cell is saved as a {@link MachineSnapshot} keyed by the cell's
-         * machineId (which is parentId for supervisors, parentId#TypeName for
-         * children). Terminal cells delete their snapshot.
-         */
         public Builder persistence(PersistenceProvider provider) {
             this.persistence = provider;
             return this;
         }
 
-        /**
-         * Enable rehydration on inbound events for unknown ids. When set, on
-         * the first event for an unknown id the framework probes persistence
-         * for every cell of that id (supervisor + each declared child type),
-         * restores any that have snapshots, then delivers the event.
-         *
-         * <p>Requires {@link #persistence(PersistenceProvider)}. Without it,
-         * the framework throws on an inbound non-first event for an unknown
-         * id (per the design checklist).
-         */
         public Builder rehydrate(boolean enabled) {
             this.rehydrateEnabled = enabled;
             return this;
         }
 
         /**
-         * Per-machine-type volatile loader. Fires on both creation (in
-         * {@link Machine#start()}) and rehydration — same callback, both
-         * paths. The returned object is stored on the machine's
-         * {@code volatileContext} slot and is NOT persisted.
+         * Per-machine-type volatile loader, addressed by the type's
+         * {@code name}. Fires on both creation and rehydration.
          */
-        public <M extends Machine<?>> Builder volatileLoader(
-                Class<M> type, Function<Machine<?>, Object> loader) {
-            TypeSpec existing = types.get(type);
+        public Builder volatileLoader(String typeName, Function<Machine<?>, Object> loader) {
+            RegistryType existing = types.get(typeName);
             if (existing == null) {
                 throw new IllegalStateException(
-                    "volatileLoader: machine type not registered: " + type.getName());
+                    "volatileLoader: machine type not registered: " + typeName);
             }
-            types.put(type, new TypeSpec(existing.factory(), existing.poolSize(), loader));
+            types.put(typeName, new RegistryType(existing.factory(), existing.poolSize(), loader));
             return this;
         }
 
-        /**
-         * Auto-create the supervisor from an inbound first event (one whose
-         * {@code isFirst()} returns true). The function receives the event
-         * and returns the supervisor's initial context. Without this hook,
-         * unknown-id inbound events are dropped (or throw, depending on
-         * rehydration config).
-         */
         public Builder createFromFirstEvent(Function<StatemachineEvent, Object> fn) {
             this.firstEventToContext = fn;
             return this;
         }
 
-        /**
-         * Hard ceiling on concurrent supervisor cells. Dispatch beyond this
-         * returns {@link RejectCause#CAPACITY_EXCEEDED}. {@code 0} disables.
-         */
         public Builder maxConcurrent(int n) { this.maxConcurrent = n; return this; }
 
-        /**
-         * Wall-clock cap on a single supervisor cell, regardless of state.
-         * On fire, transitions the supervisor to {@code targetState} (which
-         * must be a final state in the supervisor's graph); the framework
-         * then runs the standard termination ritual. {@code 0} disables.
-         */
         public Builder globalTimeout(long duration, TimeUnit unit, String targetState) {
             if (duration <= 0) throw new IllegalArgumentException("duration must be > 0");
             if (targetState == null) throw new IllegalArgumentException("targetState required");
@@ -819,38 +808,22 @@ public class Registry implements Machine.MachineRegistryHandle {
             return this;
         }
 
-        /**
-         * 1-in-N sampling for debug-flagged supervisors. Every Nth dispatch
-         * sets {@code debugMode=true} on the supervisor; state transitions
-         * emit DEBUG-level traces. {@code 0} disables.
-         */
         public Builder debugSampleRate(int n) { this.debugSampleRate = n; return this; }
 
-        /**
-         * Per-task quota-key extractor. The framework calls this on every
-         * dispatch with the task (which becomes the supervisor's initial
-         * context). Returned keys are checked against {@link #quotaLimits}.
-         */
         public Builder quotaKeysExtractor(Function<Object, QuotaKeys> extractor) {
             this.quotaKeysExtractor = extractor;
             return this;
         }
 
-        /** Quota thresholds enforced against the keys returned by {@link #quotaKeysExtractor}. */
         public Builder quotaLimits(QuotaLimits limits) {
             this.quotaLimits = limits != null ? limits : QuotaLimits.UNLIMITED;
             return this;
         }
 
-        /**
-         * Wire-protocol channel. State actions can reach it through
-         * {@code Registry.getChannel()} when they need to emit outbound
-         * commands.
-         */
         public Builder channel(Channel<?, ?> channel) { this.channel = channel; return this; }
 
         public Registry build() {
-            if (supervisorType == null) {
+            if (supervisorName == null) {
                 throw new IllegalStateException("No supervisor declared — call .supervisor(...) first");
             }
             if (rehydrateEnabled && persistence == null) {
@@ -861,7 +834,7 @@ public class Registry implements Machine.MachineRegistryHandle {
                 throw new IllegalStateException(
                     "quotaLimits enforced but no quotaKeysExtractor — keys cannot be derived");
             }
-            return new Registry(name, supervisorType, types, threads,
+            return new Registry(name, supervisorName, types, threads,
                 persistence, rehydrateEnabled, firstEventToContext,
                 maxConcurrent, globalTimeoutMs, globalTimeoutTargetState,
                 debugSampleRate, quotaKeysExtractor, quotaLimits, channel);

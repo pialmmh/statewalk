@@ -84,7 +84,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void dispatch_returns_ok_then_duplicate_on_second_call() {
         reg = Registry.builder("adm-1")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 4)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 4)
             .build();
 
         DispatchResult first = reg.dispatch("id-1", new Task());
@@ -99,7 +99,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void dispatch_returns_shutting_down_after_shutdown() {
         reg = Registry.builder("adm-shut")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 4)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 4)
             .build();
         reg.shutdown();
 
@@ -115,7 +115,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void max_concurrent_cap_rejects_overflow() {
         reg = Registry.builder("adm-cap")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 8)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 8)
             .maxConcurrent(2)
             .build();
 
@@ -133,7 +133,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void global_timeout_forces_transition_to_target_state() throws InterruptedException {
         reg = Registry.builder("adm-gto")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 4)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 4)
             .globalTimeout(200, TimeUnit.MILLISECONDS, "EXPIRED")
             .build();
 
@@ -153,7 +153,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void per_partner_concurrent_quota_rejects_overflow() {
         reg = Registry.builder("adm-q")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 8)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 8)
             .quotaKeysExtractor(t -> {
                 Task task = (Task) t;
                 return QuotaKeys.of(task.partner, task.route);
@@ -173,7 +173,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void per_route_tps_quota_rejects_burst() {
         reg = Registry.builder("adm-q-tps")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 16)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 16)
             .quotaKeysExtractor(t -> {
                 Task task = (Task) t;
                 return QuotaKeys.of(task.partner, task.route);
@@ -193,7 +193,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void quota_release_on_terminate_frees_slot() throws InterruptedException {
         reg = Registry.builder("adm-q-rel")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 8)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 8)
             .quotaKeysExtractor(t -> QuotaKeys.ofPartner(((Task) t).partner))
             .quotaLimits(new QuotaLimits(1, 0, 0, 0))
             .build();
@@ -215,7 +215,7 @@ class FlatRegistryAdmissionTest {
     void quota_keys_extractor_required_when_limits_set() {
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
             Registry.builder("adm-q-misconfig")
-                .supervisor(AdmSupervisor.class, AdmSupervisor::new, 4)
+                .supervisor("AdmSupervisor", AdmSupervisor::new, 4)
                 .quotaLimits(new QuotaLimits(1, 0, 0, 0))
                 .build());
         assertTrue(ex.getMessage().contains("quotaKeysExtractor"));
@@ -228,7 +228,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void debug_sampling_flags_one_in_n() {
         reg = Registry.builder("adm-dbg")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 16)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 16)
             .debugSampleRate(3)
             .build();
 
@@ -236,7 +236,7 @@ class FlatRegistryAdmissionTest {
         for (int i = 0; i < 9; i++) {
             String id = "d-" + i;
             reg.dispatch(id, new Task());
-            Machine<?> m = reg.findInternal(id, AdmSupervisor.class);
+            Machine<?> m = reg.findInternal(id, "AdmSupervisor");
             if (m != null && m.isDebugMode()) debugCount.incrementAndGet();
         }
         // 0, 3, 6 → exactly 3 debug-mode supervisors out of 9 dispatched.
@@ -251,7 +251,7 @@ class FlatRegistryAdmissionTest {
     void channel_is_exposed_via_get_channel() {
         FakeChannel channel = new FakeChannel("test-ch");
         reg = Registry.builder("adm-ch")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 4)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 4)
             .channel(channel)
             .build();
 
@@ -263,7 +263,7 @@ class FlatRegistryAdmissionTest {
     @Test
     void channel_defaults_to_null_when_unconfigured() {
         reg = Registry.builder("adm-no-ch")
-            .supervisor(AdmSupervisor.class, AdmSupervisor::new, 4)
+            .supervisor("AdmSupervisor", AdmSupervisor::new, 4)
             .build();
         assertNull(reg.getChannel());
     }

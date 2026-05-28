@@ -56,4 +56,24 @@ public interface PersistenceProvider {
      * <p>Idempotent — deleting a missing key is a no-op.
      */
     void delete(String machineId, String registryName);
+
+    /**
+     * Load every snapshot for {@code registryName} whose state-timeout has
+     * already matured at {@code nowMs} — that is, {@code 0 < timeoutDeadlineMs
+     * <= nowMs}.
+     *
+     * <p>Called once at registry build (when rehydration is enabled) so the
+     * framework can settle machines whose timeout fell due while the process
+     * was down. Without it those snapshots — and any external reservation they
+     * hold (e.g. a prepaid balance hold) — would persist until a coincidental
+     * inbound event for the same id happened to arrive.
+     *
+     * <p><b>Default returns empty:</b> a provider that does not implement this
+     * opts out of <em>proactive</em> startup recovery only; it still recovers
+     * lazily on inbound events via {@link #load}. Durable providers should
+     * override and push the deadline filter into the backing store.
+     */
+    default List<MachineSnapshot> loadMatured(String registryName, long nowMs) {
+        return List.of();
+    }
 }

@@ -73,6 +73,13 @@ public class Registry implements Machine.MachineRegistryHandle {
 
     public static final String CHILD_ID_SEPARATOR = "#";
 
+    /**
+     * Guard 3 threshold: a debug-sampled cell that terminates with a context
+     * Collection/Map larger than this logs a leak-smell WARN. Diagnostics only;
+     * does not affect behaviour.
+     */
+    private static final int CONTEXT_FIELD_WARN_THRESHOLD = 1000;
+
     private final String name;
     private final String supervisorName;
     private final Map<String, RegistryType> types;                           // typeName → type registration
@@ -149,6 +156,14 @@ public class Registry implements Machine.MachineRegistryHandle {
         this.quotaLimits = quotaLimits != null ? quotaLimits : QuotaLimits.UNLIMITED;
         this.channel = channel;
 
+        // Lifecycle hardening (Guard 1): reject leak-prone pooled types before
+        // any pool is allocated. The throwaway sample per type also fails fast
+        // if a factory throws at construction.
+        types.forEach((typeName, t) -> {
+            Machine<?> sample = t.factory().get();
+            PooledFieldValidator.validate(typeName, sample.getClass());
+        });
+
         this.pools = new ConcurrentHashMap<>();
         types.forEach((n, t) -> pools.put(n, makePool(n, t)));
 
@@ -160,6 +175,15 @@ public class Registry implements Machine.MachineRegistryHandle {
             this.maxConcurrent, this.globalTimeoutMs, this.globalTimeoutTargetState,
             this.debugSampleRate, this.quotaLimits.enforces(),
             channel != null ? channel.getName() : "<none>");
+
+        // Lifecycle hardening (Guard 2 / H2): settle machines whose state
+        // timeout matured while this process was down. Without it a crashed
+        // call's snapshot — and any external reservation it holds (e.g. a
+        // prepaid balance hold) — would sit forever until a coincidental
+        // inbound event for the same id arrived.
+        if (persistence != null && rehydrateEnabled) {
+            recoverMaturedOnStartup();
+        }
     }
 
     /** Exposed for state actions: the wire channel, or {@code null} if not configured. */
@@ -485,6 +509,56 @@ public class Registry implements Machine.MachineRegistryHandle {
         }
     }
 
+    /**
+     * Proactive startup recovery (H2). Loads every snapshot for this registry
+     * whose state-timeout has already matured and rehydrates each one. A
+     * matured rehydration jumps straight to the timeout's target (a final
+     * state by builder rules) and runs the terminal ritual — which deletes the
+     * snapshot and releases any quota/reservation the cell held. Supervisor
+     * snapshots are processed before children so a supervisor's terminal
+     * cascade reclaims its children before we would otherwise restore them
+     * standalone.
+     *
+     * <p>Snapshots whose timeout is still in the future are intentionally left
+     * untouched — they recover lazily on the next inbound event for their id.
+     */
+    private void recoverMaturedOnStartup() {
+        List<MachineSnapshot> matured;
+        try {
+            matured = persistence.loadMatured(name, System.currentTimeMillis());
+        } catch (RuntimeException e) {
+            LOG.warn("[{}] startup recovery: loadMatured threw: {} — skipping", name, e.toString());
+            return;
+        }
+        if (matured == null || matured.isEmpty()) return;
+
+        matured.sort((a, b) -> Boolean.compare(isChildId(a.machineId()), isChildId(b.machineId())));
+        LOG.info("[{}] startup recovery: {} matured snapshot(s) — rehydrating to settle",
+            name, matured.size());
+
+        int scheduled = 0;
+        for (MachineSnapshot snap : matured) {
+            String mid = snap.machineId();
+            String typeName = isChildId(mid)
+                ? mid.substring(mid.indexOf(CHILD_ID_SEPARATOR) + 1)
+                : supervisorName;
+            if (!types.containsKey(typeName)) {
+                LOG.warn("[{}] startup recovery: snapshot {} references unknown type {} — leaving in store",
+                    name, mid, typeName);
+                continue;
+            }
+            String parentId = isChildId(mid)
+                ? mid.substring(0, mid.indexOf(CHILD_ID_SEPARATOR))
+                : mid;
+            try {
+                if (restoreOneCell(mid, parentId, typeName)) scheduled++;
+            } catch (RuntimeException e) {
+                LOG.warn("[{}] startup recovery: restore failed for {}: {}", name, mid, e.toString());
+            }
+        }
+        LOG.info("[{}] startup recovery: {} cell(s) scheduled for settlement", name, scheduled);
+    }
+
     /** Restore every cell with a saved snapshot for the given parentId. */
     private int restoreAllCellsFor(String parentId) {
         if (persistence == null || !rehydrateEnabled) return 0;
@@ -602,6 +676,21 @@ public class Registry implements Machine.MachineRegistryHandle {
         }
         if (machine == null) { terminated.remove(key); return; }
         list.remove(machine);
+
+        // Lifecycle hardening (Guard 3): on debug-sampled cells, flag context
+        // collections that grew unbounded within the request — the one leak
+        // surface the build-time field validator can't see. Sampled only, so
+        // this never touches the hot path.
+        if (machine.isDebugMode()) {
+            Map<String, Integer> oversized =
+                ContextInspector.oversizedFields(machine.getContext(), CONTEXT_FIELD_WARN_THRESHOLD);
+            if (!oversized.isEmpty()) {
+                LOG.warn("[{}] cell {} terminated with oversized context collection(s) {} "
+                    + "(threshold {}). A context collection growing without bound within one "
+                    + "request is a leak smell — check the state actions that append to it.",
+                    name, key, oversized, CONTEXT_FIELD_WARN_THRESHOLD);
+            }
+        }
 
         try { machine.resetForReuse(); }
         catch (RuntimeException e) {

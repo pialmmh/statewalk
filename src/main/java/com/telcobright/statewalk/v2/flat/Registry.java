@@ -89,7 +89,20 @@ public class Registry implements Machine.MachineRegistryHandle {
     private final ConcurrentHashMap<String, CompletableFuture<Void>> chains = new ConcurrentHashMap<>();
     private final Set<String> terminated = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Per-cell FIFO for persistence I/O (save then terminal delete), keyed by
+     * machineId. Separate from {@link #chains} so the blocking DB write runs
+     * OFF the cell's processing chain (H1) while staying ordered per cell.
+     */
+    private final ConcurrentHashMap<String, CompletableFuture<Void>> saveChains = new ConcurrentHashMap<>();
+
     private final BoundedVirtualThreadExecutor work;
+    /**
+     * Dedicated executor for persistence writes (H1) — isolates the blocking DB
+     * write from processing so a slow store can't starve event handling.
+     * {@code null} when no persistence is configured.
+     */
+    private final BoundedVirtualThreadExecutor persistWork;
     private final TimeoutManager timeouts;
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
 
@@ -146,6 +159,9 @@ public class Registry implements Machine.MachineRegistryHandle {
         this.timeouts = new TimeoutManager(name, Math.max(2, threads));
         this.work = new BoundedVirtualThreadExecutor(name, Math.max(16, types.size() * 100));
         this.persistence = persistence;
+        this.persistWork = persistence != null
+            ? new BoundedVirtualThreadExecutor(name + "-persist", Math.max(16, types.size() * 100))
+            : null;
         this.rehydrateEnabled = rehydrateEnabled;
         this.firstEventToContext = firstEventToContext;
         this.maxConcurrent = Math.max(0, maxConcurrent);
@@ -348,8 +364,21 @@ public class Registry implements Machine.MachineRegistryHandle {
                 catch (ExecutionException ignored) { /* logged in chainSubmit */ }
                 catch (TimeoutException e) { return false; }
             }
+            // Drain the persistence save chains too (H1) so post-await assertions
+            // about the store / recorder are deterministic.
+            for (var f : new ArrayList<>(saveChains.values())) {
+                long remainingNs = Math.max(0, deadlineNs - System.nanoTime());
+                if (remainingNs == 0) return false;
+                try { f.get(remainingNs, TimeUnit.NANOSECONDS); }
+                catch (ExecutionException ignored) {}
+                catch (TimeoutException e) { return false; }
+            }
             long remainingNs = Math.max(0, deadlineNs - System.nanoTime());
             if (!work.awaitIdle(remainingNs, TimeUnit.NANOSECONDS)) return false;
+            if (persistWork != null) {
+                remainingNs = Math.max(0, deadlineNs - System.nanoTime());
+                if (!persistWork.awaitIdle(remainingNs, TimeUnit.NANOSECONDS)) return false;
+            }
             int cells = activeCellCount();
             if (cells == prev) { stable++; if (stable >= 2) return true; }
             else { stable = 0; prev = cells; }
@@ -364,6 +393,12 @@ public class Registry implements Machine.MachineRegistryHandle {
         }
         try { work.awaitIdle(5, TimeUnit.SECONDS); }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        if (persistWork != null) {
+            // Let queued saves/deletes flush before closing the store-facing executor.
+            try { persistWork.awaitIdle(5, TimeUnit.SECONDS); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            persistWork.close();
+        }
         work.close();
         timeouts.shutdown();
         pools.values().forEach(ObjectPoolManager::clear);
@@ -486,7 +521,14 @@ public class Registry implements Machine.MachineRegistryHandle {
     // Persistence + rehydration internals
     // ─────────────────────────────────────────────────────────────────
 
-    /** Called on every successful transition via the per-machine handle. */
+    /**
+     * Called on every successful transition via the per-machine handle (H1).
+     * Builds the snapshot <b>inline</b> — capturing a consistent point-in-time
+     * of the context, which may move on before the async write runs — then
+     * offloads the blocking {@code save} to the cell's save chain on the
+     * dedicated {@link #persistWork} executor. The processing chain never
+     * blocks on the DB.
+     */
     void persistCellSnapshot(String machineId, String typeName,
                               String newState, long timeoutDeadlineMs,
                               String timeoutTargetState) {
@@ -497,16 +539,63 @@ public class Registry implements Machine.MachineRegistryHandle {
         Machine<?> m = findInternal(parentId, typeName);
         if (m == null) return;
         Object ctx = m.getContext();
+        final MachineSnapshot snap;
         try {
+            // Serialize INLINE: the snapshot must reflect the state as of THIS
+            // transition, not whenever the async write later runs.
             String b64 = SnapshotSerializer.contextToBase64Json(ctx);
             String ctxClass = ctx != null ? ctx.getClass().getName() : null;
-            MachineSnapshot snap = new MachineSnapshot(
+            snap = new MachineSnapshot(
                 machineId, name, newState, ctxClass, b64,
                 System.currentTimeMillis(), timeoutTargetState, timeoutDeadlineMs);
-            persistence.save(snap);
         } catch (RuntimeException e) {
-            LOG.warn("[{}] persistence save failed for {}: {}", name, machineId, e.toString());
+            // Can't even capture this cell's state → its recovery snapshot would
+            // be stale/missing. Fail the request rather than run un-persistably.
+            LOG.error("[{}] snapshot serialize failed for {}: {} — failing the request",
+                name, machineId, e.toString());
+            failRequest(parentId);
+            return;
         }
+        submitPersist(parentId, machineId, () -> persistence.save(snap), /* failOnError */ true);
+    }
+
+    /**
+     * Append a persistence op to a cell's FIFO save chain on {@link #persistWork}.
+     * Ordered per machineId, so {@code save(A) → save(B) → delete} apply in
+     * transition order. On a write failure: {@code failOnError} true (save) fails
+     * the whole request; false (terminal delete) logs only — the cell is already
+     * gone, a missed delete is benign (it gets re-deleted on next terminate or
+     * cleaned by startup recovery).
+     */
+    private void submitPersist(String parentId, String machineId, Runnable io, boolean failOnError) {
+        saveChains.compute(machineId, (k, prev) -> {
+            CompletableFuture<Void> base = (prev == null)
+                ? CompletableFuture.completedFuture(null) : prev;
+            return base.thenRunAsync(() -> {
+                try { io.run(); }
+                catch (Throwable t) {
+                    if (failOnError) {
+                        LOG.error("[{}] persistence write failed for {}: {} — failing the request",
+                            name, machineId, t.toString());
+                        failRequest(parentId);
+                    } else {
+                        LOG.warn("[{}] persistence delete failed for {}: {}",
+                            name, machineId, t.toString());
+                    }
+                }
+            }, persistWork.asExecutor());
+        });
+    }
+
+    /**
+     * Fail a whole request because its state could not be persisted. Runs the
+     * teardown on the supervisor's processing chain (mirrors the global-timeout
+     * path) so it serializes with in-flight processing rather than racing it
+     * from the persist thread. Dedup in {@link #onCellTerminated} makes a
+     * redundant call (e.g. an already-terminated request) a no-op.
+     */
+    private void failRequest(String parentId) {
+        chainSubmit(cellKey(parentId, supervisorName), () -> forceCleanupAll(parentId));
     }
 
     /**
@@ -705,15 +794,17 @@ public class Registry implements Machine.MachineRegistryHandle {
 
         // Drop the persisted snapshot for this cell — it has reached a final
         // state, the framework ran the termination ritual, and the machine is
-        // back in the pool. Crash-rehydration must NOT resurrect it.
+        // back in the pool. Crash-rehydration must NOT resurrect it. Routed
+        // through the same save chain so it lands AFTER any pending saves for
+        // this cell (ordering), then the chain entry is retired.
         if (persistence != null) {
             String cellMachineId = typeName.equals(supervisorName)
                 ? parentId
                 : parentId + CHILD_ID_SEPARATOR + typeName;
-            try { persistence.delete(cellMachineId, name); }
-            catch (RuntimeException e) {
-                LOG.warn("[{}] persistence delete failed for {}: {}", name, cellMachineId, e.toString());
-            }
+            submitPersist(parentId, cellMachineId,
+                () -> persistence.delete(cellMachineId, name), /* failOnError */ false);
+            CompletableFuture<Void> chain = saveChains.get(cellMachineId);
+            if (chain != null) chain.whenComplete((v, t) -> saveChains.remove(cellMachineId, chain));
         }
 
         // Cascade if the supervisor terminated.

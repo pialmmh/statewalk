@@ -3,6 +3,7 @@ package com.telcobright.statewalk.v2.flat;
 import com.telcobright.statewalk.v2.machine.Machine;
 import com.telcobright.statewalk.v2.persistence.InMemoryPersistenceProvider;
 import com.telcobright.statewalk.v2.persistence.MachineSnapshot;
+import com.telcobright.statewalk.v2.persistence.PersistenceProvider;
 import com.telcobright.statewalk.v2.persistence.SnapshotSerializer;
 import com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent;
 import com.telcobright.statewalk.v2.state.StateMap;
@@ -13,7 +14,9 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -238,5 +241,58 @@ class LifecycleHardeningTest {
         assertTrue(ContextInspector.oversizedFields(null, 10).isEmpty());
         assertTrue(ContextInspector.oversizedFields(new FatCtx(), 0).isEmpty(),
             "empty collections never exceed threshold 0");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // H1 — async persistence: write runs off the processing chain,
+    //      and a write FAILURE fails the request (force-cleanup)
+    // ─────────────────────────────────────────────────────────────────
+
+    /** Supervisor whose only non-IDLE state has a long (1h) timeout, so the only
+     *  fast way it can terminate in this test is the persistence-failure path. */
+    static final SupervisorSpec<Ctx> LONG_SUP = SupervisorSpec.<Ctx>builder()
+        .name("LongRunning")
+        .contextFactory(Ctx::new)
+        .stateMap(StateMap.builder()
+            .initialState("RUN")
+            .state("RUN").interim().timeout(1, TimeUnit.HOURS, "DONE")
+            .state("DONE").finalState().timeout(1, TimeUnit.SECONDS, "DONE")
+            .build())
+        .routes(r -> r.selfHandle(Go.class))
+        .build();
+
+    /** Provider whose save() always throws, and counts attempts (to prove the
+     *  write actually ran on the async save chain, not inline). */
+    static final class FailingPersistenceProvider implements PersistenceProvider {
+        final AtomicInteger saveAttempts = new AtomicInteger();
+        @Override public void save(MachineSnapshot s) {
+            saveAttempts.incrementAndGet();
+            throw new RuntimeException("simulated store write failure");
+        }
+        @Override public Optional<MachineSnapshot> load(String id, String reg) { return Optional.empty(); }
+        @Override public List<MachineSnapshot> loadAll(String id) { return List.of(); }
+        @Override public void delete(String id, String reg) {}
+    }
+
+    @Test
+    void h1_persistenceWriteFailure_failsTheRequest() throws Exception {
+        FailingPersistenceProvider store = new FailingPersistenceProvider();
+        Registry reg = Registry.builder("h1-fail")
+            .supervisor(LONG_SUP, 4)
+            .persistence(store)         // rehydrate intentionally off
+            .threads(2)
+            .build();
+        try {
+            assertTrue(reg.dispatch("f-1", new Ctx()).accepted(), "dispatch passes the sync gates");
+            // first transition (RUN) → snapshot save on the async chain → throws → failRequest
+            assertTrue(reg.awaitIdle(3, TimeUnit.SECONDS), "registry drains after the induced failure");
+            assertEquals(0, reg.activeCellCount(),
+                "a persistence WRITE failure force-cleaned the request (RUN's 1h timer ruled out)");
+            assertFalse(reg.hasAny("f-1"));
+            assertTrue(store.saveAttempts.get() >= 1,
+                "the save actually executed (on the dedicated persist executor), then failed");
+        } finally {
+            reg.shutdown();
+        }
     }
 }

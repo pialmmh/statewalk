@@ -187,10 +187,11 @@ class LifecycleHardeningTest {
     }
 
     @Test
-    void startup_recovery_leaves_unmatured_snapshot_untouched() throws InterruptedException {
+    void startup_recovery_resumes_unmatured_snapshot() throws InterruptedException {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
         long now = System.currentTimeMillis();
-        // Deadline an hour in the FUTURE → not matured → must not be proactively rehydrated.
+        // Deadline an hour in the FUTURE → not matured → RESUMED and kept running
+        // (failover: a fresh node continues the in-flight request).
         store.save(new MachineSnapshot(
             "alive-1", "h-recover2", "RUNNING",
             Ctx.class.getName(), SnapshotSerializer.contextToBase64Json(new Ctx()),
@@ -204,8 +205,9 @@ class LifecycleHardeningTest {
             .build();
         try {
             assertTrue(reg.awaitIdle(2, TimeUnit.SECONDS));
-            assertEquals(1, store.size(), "unmatured snapshot left for lazy recovery");
-            assertEquals(0, reg.activeCellCount(), "not proactively rehydrated at startup");
+            assertEquals(1, reg.activeCellCount(), "unmatured machine resumed at startup (failover)");
+            assertTrue(reg.hasAny("alive-1"), "resumed request is live again");
+            assertEquals(1, store.size(), "still persisted (not terminal) — its timer keeps running");
         } finally {
             reg.shutdown();
         }

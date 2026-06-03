@@ -230,6 +230,34 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
         return out;
     }
 
+    @Override
+    public List<MachineSnapshot> loadAllForRegistry(String registryName) {
+        String sql = "SELECT machine_id, current_state, context_class, context_json_b64, "
+            + "saved_at_ms, timeout_target_state, timeout_deadline_ms "
+            + "FROM " + table + " WHERE registry_name=?";
+        List<MachineSnapshot> out = new ArrayList<>();
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, registryName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new MachineSnapshot(
+                        rs.getString(1),
+                        registryName,
+                        rs.getString(2),
+                        rs.getString(3),
+                        rs.getString(4),
+                        rs.getLong  (5),
+                        rs.getString(6),
+                        rs.getLong  (7)));
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("loadAllForRegistry failed for " + registryName + ": " + e.getMessage(), e);
+        }
+        return out;
+    }
+
     /** Test helper: how many rows are currently in the table. */
     public int size() {
         try (Connection c = dataSource.getConnection();

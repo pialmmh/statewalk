@@ -76,4 +76,21 @@ public interface PersistenceProvider {
     default List<MachineSnapshot> loadMatured(String registryName, long nowMs) {
         return List.of();
     }
+
+    /**
+     * Load <b>every</b> snapshot for {@code registryName} — i.e. every
+     * unfinished machine, since terminal snapshots are deleted on terminate.
+     *
+     * <p>Called once at registry build (when rehydration is enabled) so a fresh
+     * node can resume all in-flight requests after a failover/restart: matured
+     * cells settle, the rest keep running. This is the disaster-recovery entry
+     * point — the new node rebuilds state from redis/db and carries on.
+     *
+     * <p><b>Default returns empty:</b> a provider that does not implement this
+     * opts out of proactive startup resume; lazy rehydration on inbound events
+     * still works. Durable providers should override.
+     */
+    default List<MachineSnapshot> loadAllForRegistry(String registryName) {
+        return List.of();
+    }
 }

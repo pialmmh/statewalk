@@ -63,6 +63,16 @@ public class InMemoryPersistenceProvider implements PersistenceProvider {
         return out;
     }
 
+    @Override
+    public List<MachineSnapshot> loadAllForRegistry(String registryName) {
+        List<MachineSnapshot> out = new ArrayList<>();
+        for (Map<String, MachineSnapshot> byReg : store.values()) {
+            MachineSnapshot s = byReg.get(registryName);
+            if (s != null) out.add(s);
+        }
+        return out;
+    }
+
     /** Test helper: total snapshot count across all ids and registries. */
     public int size() {
         int total = 0;

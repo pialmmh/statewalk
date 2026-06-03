@@ -95,6 +95,15 @@ public abstract class Machine<C> implements Poolable {
     private ScheduledFuture<?> stateTimeoutFuture;
 
     /**
+     * Absolute epoch-ms deadline of the current state's timeout (0 if none) and
+     * its target state — captured on state entry (and on rehydrate) so a
+     * {@code .stay()} can re-persist the mutated context WITHOUT resetting the
+     * state timer.
+     */
+    private volatile long currentDeadlineMs;
+    private volatile String currentTimeoutTarget;
+
+    /**
      * If true, this machine emits DEBUG-level state-transition traces (state +
      * context + event tuple) on every {@link #fire(StatemachineEvent)} and
      * {@link #transitionTo(String)}. Set by the registry at dispatch based on
@@ -310,6 +319,12 @@ public abstract class Machine<C> implements Poolable {
             if (debugMode && LOG.isDebugEnabled()) {
                 LOG.debug("[{}] stay state={} ctx={}", machineId, currentState, context);
             }
+            // A stay handler mutated the context without changing state — persist
+            // it. Re-emit the CURRENT state with its UNCHANGED deadline so the
+            // stay does not reset the snapshot's state timer.
+            if (!terminated) {
+                registry.onStateTransitioned(machineId, currentState, currentDeadlineMs, currentTimeoutTarget);
+            }
             return;
         }
         // Walk guarded transition list in declaration order; first match wins.
@@ -418,6 +433,8 @@ public abstract class Machine<C> implements Poolable {
             ? System.currentTimeMillis() + next.timeout().unit().toMillis(next.timeout().duration())
             : 0L;
         String timeoutTarget = next.timeout() != null ? next.timeout().targetState() : null;
+        this.currentDeadlineMs = deadlineMs;          // remembered so a later .stay() re-persists with the same deadline
+        this.currentTimeoutTarget = timeoutTarget;
         registry.onStateTransitioned(machineId, next.name(), deadlineMs, timeoutTarget);
 
         // 6a. offline? notify registry to suspend. Per spec, the offline
@@ -493,6 +510,8 @@ public abstract class Machine<C> implements Poolable {
         this.started = true;
         this.terminated = false;
         this.currentState = savedStateName;
+        this.currentDeadlineMs = timeoutDeadlineMs;       // so a .stay() after resume re-persists the right deadline
+        this.currentTimeoutTarget = timeoutTargetState;
 
         StateConfig saved = stateMap.get(savedStateName);
         long now = System.currentTimeMillis();
@@ -563,6 +582,8 @@ public abstract class Machine<C> implements Poolable {
         terminated = false;
         debugMode = false;
         currentState = StateMap.IDLE;
+        currentDeadlineMs = 0L;
+        currentTimeoutTarget = null;
     }
 
     // ─────────────────────────────────────────────────────────────────

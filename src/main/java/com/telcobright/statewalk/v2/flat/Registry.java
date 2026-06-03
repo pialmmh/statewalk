@@ -178,6 +178,14 @@ public class Registry implements Machine.MachineRegistryHandle {
         types.forEach((typeName, t) -> {
             Machine<?> sample = t.factory().get();
             PooledFieldValidator.validate(typeName, sample.getClass());
+            // Offline states suspend the machine to the store and resume it later
+            // — that requires a persistence provider.
+            if (persistence == null && sample.peekStateMap().hasOfflineState()) {
+                throw new IllegalStateException(
+                    "[" + name + "] type '" + typeName + "' declares an offline state but no "
+                    + "persistence is configured — offline machines are suspended to (and resumed "
+                    + "from) the store. Call .persistence(...).");
+            }
         });
 
         this.pools = new ConcurrentHashMap<>();
@@ -192,13 +200,12 @@ public class Registry implements Machine.MachineRegistryHandle {
             this.debugSampleRate, this.quotaLimits.enforces(),
             channel != null ? channel.getName() : "<none>");
 
-        // Lifecycle hardening (Guard 2 / H2): settle machines whose state
-        // timeout matured while this process was down. Without it a crashed
-        // call's snapshot — and any external reservation it holds (e.g. a
-        // prepaid balance hold) — would sit forever until a coincidental
-        // inbound event for the same id arrived.
+        // Startup recovery (failover / restart): resume every unfinished machine
+        // from the store so a fresh node continues in-flight work — matured cells
+        // settle, the rest keep running. Lazy rehydration (on inbound events) and
+        // offline-suspend resume share the same restore path.
         if (persistence != null && rehydrateEnabled) {
-            recoverMaturedOnStartup();
+            recoverUnfinishedOnStartup();
         }
     }
 
@@ -512,6 +519,9 @@ public class Registry implements Machine.MachineRegistryHandle {
         @Override public void publish(StatemachineEvent event) {
             reg.onInboundEvent(parentId, event);
         }
+        @Override public void onMachineWentOffline(String mid) {
+            reg.onCellWentOffline(parentId, typeName);
+        }
 
         /** Supervisor uses this to reach back into the owning Registry. */
         Registry registry() { return reg; }
@@ -599,53 +609,103 @@ public class Registry implements Machine.MachineRegistryHandle {
     }
 
     /**
-     * Proactive startup recovery (H2). Loads every snapshot for this registry
-     * whose state-timeout has already matured and rehydrates each one. A
-     * matured rehydration jumps straight to the timeout's target (a final
-     * state by builder rules) and runs the terminal ritual — which deletes the
-     * snapshot and releases any quota/reservation the cell held. Supervisor
-     * snapshots are processed before children so a supervisor's terminal
-     * cascade reclaims its children before we would otherwise restore them
-     * standalone.
+     * A cell entered an {@code .offline()} state — <b>suspend</b> it rather than
+     * terminate: keep the persisted snapshot (the resume point), evict the live
+     * machine (active map + pool return), and drop its processing chain. An
+     * inbound event for the id, or a startup load-all, rehydrates it.
      *
-     * <p>Snapshots whose timeout is still in the future are intentionally left
-     * untouched — they recover lazily on the next inbound event for their id.
+     * <p>Offline REQUIRES persistence — without a store there is nowhere to
+     * suspend to, so the cell is terminated instead (a build-time check also
+     * rejects offline-without-persistence, so this is just defence in depth).
+     *
+     * <p>When the SUPERVISOR goes offline the whole request is suspended (every
+     * cell evicted, all snapshots kept, the global timeout cancelled); a child
+     * going offline suspends only that child.
      */
-    private void recoverMaturedOnStartup() {
-        List<MachineSnapshot> matured;
-        try {
-            matured = persistence.loadMatured(name, System.currentTimeMillis());
-        } catch (RuntimeException e) {
-            LOG.warn("[{}] startup recovery: loadMatured threw: {} — skipping", name, e.toString());
+    void onCellWentOffline(String parentId, String typeName) {
+        if (persistence == null) {
+            LOG.warn("[{}] {}/{} entered an offline state but no persistence is configured — "
+                + "cannot suspend, terminating instead", name, parentId, typeName);
+            onCellTerminated(parentId, typeName);
             return;
         }
-        if (matured == null || matured.isEmpty()) return;
+        if (typeName.equals(supervisorName)) {
+            List<Machine<?>> list = active.get(parentId);
+            if (list == null) return;
+            for (Machine<?> m : new ArrayList<>(list)) suspendCell(parentId, m.getTypeName());
+            active.remove(parentId);
+            cancelGlobalTimeout(parentId);
+            LOG.debug("[{}] request {} suspended (supervisor offline) — snapshots retained", name, parentId);
+        } else {
+            suspendCell(parentId, typeName);
+            LOG.debug("[{}] {}/{} suspended (child offline)", name, parentId, typeName);
+        }
+    }
 
-        matured.sort((a, b) -> Boolean.compare(isChildId(a.machineId()), isChildId(b.machineId())));
-        LOG.info("[{}] startup recovery: {} matured snapshot(s) — rehydrating to settle",
-            name, matured.size());
+    /** Evict one cell from memory WITHOUT deleting its snapshot (offline suspend). */
+    private void suspendCell(String parentId, String typeName) {
+        List<Machine<?>> list = active.get(parentId);
+        if (list == null) return;
+        Machine<?> machine = null;
+        for (Machine<?> m : list) {
+            if (typeName.equals(m.getTypeName())) { machine = m; break; }
+        }
+        if (machine == null) return;
+        list.remove(machine);
+        chains.remove(cellKey(parentId, typeName));
+        try { machine.resetForReuse(); }
+        catch (RuntimeException e) {
+            LOG.warn("[{}] reset threw suspending {}/{}: {}", name, parentId, typeName, e.toString());
+        }
+        if (machine.isIdle()) {
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            ObjectPoolManager pool = (ObjectPoolManager) pools.get(typeName);
+            pool.returnObject(machine);
+        }
+        // Snapshot intentionally KEPT — it is the rehydration source for resume.
+    }
 
-        int scheduled = 0;
-        for (MachineSnapshot snap : matured) {
+    /**
+     * Startup recovery for failover / restart. Loads <b>every unfinished</b>
+     * machine for this registry from the store and resumes it. After a node
+     * dies and an external supervisor launches the registry on a fresh node,
+     * this rebuilds all in-flight requests: <em>matured</em> cells settle (their
+     * timeout fires on rehydrate → terminal → snapshot deleted), and the rest
+     * reschedule their remaining timeout and keep running — so ongoing calls
+     * continue as if there had been no disaster.
+     *
+     * <p>Snapshots exist only for unfinished machines (terminal ones are deleted
+     * on terminate), so "all snapshots for this registry" == "all unfinished".
+     * Requests are restored whole (supervisor + children) via
+     * {@link #restoreAllCellsFor}, deduped by parent id.
+     */
+    private void recoverUnfinishedOnStartup() {
+        List<MachineSnapshot> unfinished;
+        try {
+            unfinished = persistence.loadAllForRegistry(name);
+        } catch (RuntimeException e) {
+            LOG.warn("[{}] startup recovery: loadAllForRegistry threw: {} — skipping", name, e.toString());
+            return;
+        }
+        if (unfinished == null || unfinished.isEmpty()) return;
+
+        java.util.LinkedHashSet<String> parentIds = new java.util.LinkedHashSet<>();
+        for (MachineSnapshot snap : unfinished) {
             String mid = snap.machineId();
-            String typeName = isChildId(mid)
-                ? mid.substring(mid.indexOf(CHILD_ID_SEPARATOR) + 1)
-                : supervisorName;
-            if (!types.containsKey(typeName)) {
-                LOG.warn("[{}] startup recovery: snapshot {} references unknown type {} — leaving in store",
-                    name, mid, typeName);
-                continue;
-            }
-            String parentId = isChildId(mid)
-                ? mid.substring(0, mid.indexOf(CHILD_ID_SEPARATOR))
-                : mid;
-            try {
-                if (restoreOneCell(mid, parentId, typeName)) scheduled++;
-            } catch (RuntimeException e) {
-                LOG.warn("[{}] startup recovery: restore failed for {}: {}", name, mid, e.toString());
+            parentIds.add(isChildId(mid) ? mid.substring(0, mid.indexOf(CHILD_ID_SEPARATOR)) : mid);
+        }
+        LOG.info("[{}] startup recovery: {} unfinished snapshot(s) across {} request(s) — resuming",
+            name, unfinished.size(), parentIds.size());
+
+        int resumed = 0;
+        for (String parentId : parentIds) {
+            try { resumed += restoreAllCellsFor(parentId); }
+            catch (RuntimeException e) {
+                LOG.warn("[{}] startup recovery: resume failed for {}: {}", name, parentId, e.toString());
             }
         }
-        LOG.info("[{}] startup recovery: {} cell(s) scheduled for settlement", name, scheduled);
+        LOG.info("[{}] startup recovery: {} cell(s) resumed (matured ones settle, the rest keep running)",
+            name, resumed);
     }
 
     /** Restore every cell with a saved snapshot for the given parentId. */

@@ -314,22 +314,12 @@ public abstract class Machine<C> implements Poolable {
                 machineId, currentState, event.getClass().getSimpleName(), context);
         }
 
-        BiConsumer<Object, StatemachineEvent> stay = cur.stayActions().get(event.getClass());
-        if (stay != null) {
-            stay.accept(this, event);
-            if (debugMode && LOG.isDebugEnabled()) {
-                LOG.debug("[{}] stay state={} ctx={}", machineId, currentState, context);
-            }
-            // A stay handler mutated the context without changing state — persist
-            // it. Re-emit the CURRENT state with its UNCHANGED deadline so the
-            // stay does not reset the snapshot's state timer.
-            if (!terminated && registry != null) {
-                registry.onStateTransitioned(machineId, currentState, currentDeadlineMs, currentTimeoutTarget);
-            }
-            return;
-        }
-        // Walk guarded transition list in declaration order; first match wins.
-        // A null guard counts as "always true" (unconditional / fallback).
+        // 1. Guarded transitions first — walk in declaration order, first
+        // passing guard wins. A null guard counts as "always true". A guarded
+        // transition that fires takes precedence over any stay handler for the
+        // same event; the stay handler (below) is only the no-transition
+        // fallback. Declaring both .on(guard) and .stay() for one event class
+        // is therefore legal: guard-pass transitions, guard-fail stays.
         var options = cur.transitions().get(event.getClass());
         if (options != null) {
             for (var opt : options) {
@@ -353,9 +343,25 @@ public abstract class Machine<C> implements Poolable {
                 }
             }
             if (debugMode && LOG.isDebugEnabled()) {
-                LOG.debug("[{}] event={} state={} — all guards rejected; staying",
+                LOG.debug("[{}] event={} state={} — all guards rejected; trying stay",
                     machineId, event.getClass().getSimpleName(), currentState);
             }
+        }
+
+        // 2. No transition fired — run the stay handler if one is declared.
+        BiConsumer<Object, StatemachineEvent> stay = cur.stayActions().get(event.getClass());
+        if (stay != null) {
+            stay.accept(this, event);
+            if (debugMode && LOG.isDebugEnabled()) {
+                LOG.debug("[{}] stay state={} ctx={}", machineId, currentState, context);
+            }
+            // A stay handler mutated the context without changing state — persist
+            // it. Re-emit the CURRENT state with its UNCHANGED deadline so the
+            // stay does not reset the snapshot's state timer.
+            if (!terminated && registry != null) {
+                registry.onStateTransitioned(machineId, currentState, currentDeadlineMs, currentTimeoutTarget);
+            }
+            return;
         }
         // else silently ignore (machine doesn't care about this event in this state)
     }

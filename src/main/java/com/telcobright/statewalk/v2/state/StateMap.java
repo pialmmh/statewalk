@@ -271,6 +271,18 @@ public final class StateMap {
                 return this;
             }
 
+            /**
+             * Handle {@code eventType} without leaving the state — the handler
+             * runs and the machine stays put (the mutated context is
+             * re-persisted with the unchanged state deadline).
+             *
+             * <p>If the same state also declares guarded {@code on(...)}
+             * transitions for this event, those are evaluated <em>first</em>:
+             * the stay handler only runs when no guard passes. This makes the
+             * pattern "transition on a specific condition, otherwise observe
+             * and stay" expressible — e.g. {@code .on(Progress, "ACTIVE",
+             * e -> e.answered())} plus {@code .stay(Progress, recordRing)}.
+             */
             public StateBuilder stay(Class<? extends StatemachineEvent> eventType,
                                      BiConsumer<Object, StatemachineEvent> handler) {
                 stayActions.put(eventType, handler);

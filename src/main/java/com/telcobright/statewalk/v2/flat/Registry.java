@@ -783,11 +783,15 @@ public class Registry implements Machine.MachineRegistryHandle {
             }
         }
         String parentId = isChildId(id) ? id.substring(0, id.indexOf(CHILD_ID_SEPARATOR)) : id;
-        m.setRegistry(new PerMachineHandle(this, parentId, typeName));
-        m.setMachineId(id);
-        m.setTypeName(typeName);
-        if (t.volatileLoader() != null) m.setVolatileContextLoader(t.volatileLoader());
-        if (task != null) ((Machine) m).setInitialContext(task);
+        synchronized (m) {
+            m.setRegistry(new PerMachineHandle(this, parentId, typeName));
+            m.setMachineId(id);
+            m.setTypeName(typeName);
+            if (t.volatileLoader() != null) m.setVolatileContextLoader(t.volatileLoader());
+            if (task != null) ((Machine) m).setInitialContext(task);
+            LOG.info("[{}] borrowAndStart: id={} type={} registrySet={} idle={}",
+                name, id, typeName, m.getRegistry() != null, m.isIdle());
+        }
 
         // 1-in-N debug sampling — only sample at the supervisor; children
         // inherit by being part of the same logical request.

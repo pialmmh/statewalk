@@ -62,11 +62,11 @@ public abstract class Machine<C> implements Poolable {
     /** Set lazily on first {@link #start()} so subclasses don't repay graph build cost per borrow. */
     private StateMap stateMap;
 
-    /** Bound by the registry on borrow; cleared on reset. */
-    private MachineRegistryHandle registry;
-    private String machineId;
-    private String typeName;
-    private C context;
+    /** Bound by the registry on borrow; cleared on reset. volatile for cross-thread visibility. */
+    private volatile MachineRegistryHandle registry;
+    private volatile String machineId;
+    private volatile String typeName;
+    private volatile C context;
 
     /**
      * Truly volatile context — never persisted to snapshots. Holds config
@@ -228,8 +228,9 @@ public abstract class Machine<C> implements Poolable {
      */
     public final synchronized void start() {
         if (registry == null) {
-            throw new IllegalStateException(
-                "Machine cannot run without a registry. Use registry.dispatch(...) or spawnChild(...).");
+            LOG.warn("Machine start() skipped — no registry handle (already reset?). id={}, type={}, started={}, terminated={}",
+                machineId, typeName, started, terminated);
+            return;
         }
         if (started) {
             throw new IllegalStateException("Machine already started: " + machineId);
@@ -293,8 +294,8 @@ public abstract class Machine<C> implements Poolable {
      */
     public final void publishEvent(com.telcobright.statewalk.v2.registry.consumes.StatemachineEvent event) {
         if (registry == null) {
-            throw new IllegalStateException(
-                "Cannot publish — machine has no registry handle (call before start or after reset).");
+            LOG.warn("publishEvent ignored — no registry handle (call before start or after reset): {}", event);
+            return;
         }
         registry.publish(event);
     }
@@ -305,7 +306,7 @@ public abstract class Machine<C> implements Poolable {
      * state has no entry for the event class.
      */
     public final synchronized void fire(StatemachineEvent event) {
-        if (!started || terminated) return;
+        if (!started || terminated || registry == null) return;
         StateConfig cur = stateMap.get(currentState);
 
         if (debugMode && LOG.isDebugEnabled()) {
@@ -322,7 +323,7 @@ public abstract class Machine<C> implements Poolable {
             // A stay handler mutated the context without changing state — persist
             // it. Re-emit the CURRENT state with its UNCHANGED deadline so the
             // stay does not reset the snapshot's state timer.
-            if (!terminated) {
+            if (!terminated && registry != null) {
                 registry.onStateTransitioned(machineId, currentState, currentDeadlineMs, currentTimeoutTarget);
             }
             return;
@@ -375,7 +376,7 @@ public abstract class Machine<C> implements Poolable {
      * </ol>
      */
     public final synchronized void transitionTo(String target) {
-        if (terminated) return;
+        if (terminated || registry == null) return;
 
         StateConfig cur = currentState != null ? stateMap.get(currentState) : null;
 
@@ -401,7 +402,7 @@ public abstract class Machine<C> implements Poolable {
         }
 
         // 4. schedule new state's timeout
-        if (next.timeout() != null) {
+        if (next.timeout() != null && registry != null) {
             StateConfig.Timeout to = next.timeout();
             stateTimeoutFuture = registry.schedule(
                 machineId,
@@ -435,18 +436,22 @@ public abstract class Machine<C> implements Poolable {
         String timeoutTarget = next.timeout() != null ? next.timeout().targetState() : null;
         this.currentDeadlineMs = deadlineMs;          // remembered so a later .stay() re-persists with the same deadline
         this.currentTimeoutTarget = timeoutTarget;
+        if (registry == null) {
+            LOG.warn("transitionTo: registry became null mid-transition for {} state={}", machineId, next.name());
+            return;
+        }
         registry.onStateTransitioned(machineId, next.name(), deadlineMs, timeoutTarget);
 
         // 6a. offline? notify registry to suspend. Per spec, the offline
         // state's exit action is NOT fired during this transition — the
         // machine is being suspended, not leaving the state.
-        if (next.offline() && !terminated) {
+        if (next.offline() && !terminated && registry != null) {
             registry.onMachineWentOffline(machineId);
             return;
         }
 
         // 6b. terminal? signal registry to run the 8-step ritual.
-        if (next.finalState() && !terminated) {
+        if (next.finalState() && !terminated && registry != null) {
             terminated = true;
             registry.onMachineReachedTerminal(machineId);
         }

@@ -112,10 +112,10 @@ class SmokeTest {
     // ─── tests ────────────────────────────────────────────────────────
 
     @Test
-    void machine_cannot_run_without_registry() {
+    void machine_without_registry_skips_start() {
         DemoMachine m = new DemoMachine();
-        IllegalStateException ex = assertThrows(IllegalStateException.class, m::start);
-        assertTrue(ex.getMessage().contains("registry"));
+        m.start();  // should log warning and return gracefully (not throw)
+        assertFalse(m.isStarted());
     }
 
     @Test

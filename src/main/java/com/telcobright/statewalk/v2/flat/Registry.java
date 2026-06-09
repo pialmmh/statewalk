@@ -873,9 +873,15 @@ public class Registry implements Machine.MachineRegistryHandle {
 
         // Cascade if the supervisor terminated.
         if (typeName.equals(supervisorName)) {
+            // Queue child cleanup onto each child's OWN chain so resetForReuse()
+            // runs AFTER all pending events (fire/start) on that chain complete.
+            // This prevents clearing registry while the child still has queued work.
             for (Machine<?> sibling : new ArrayList<>(list)) {
                 String sibType = sibling.getTypeName();
-                try { onCellTerminated(parentId, sibType); } catch (RuntimeException ignored) {}
+                String sibKey = cellKey(parentId, sibType);
+                chainSubmit(sibKey, () -> {
+                    try { onCellTerminated(parentId, sibType); } catch (RuntimeException ignored) {}
+                });
             }
             active.remove(parentId);
             cancelGlobalTimeout(parentId);

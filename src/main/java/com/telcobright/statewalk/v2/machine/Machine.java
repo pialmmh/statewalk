@@ -413,12 +413,17 @@ public abstract class Machine<C> implements Poolable {
             stateTimeoutFuture = registry.schedule(
                 machineId,
                 () -> {
+                    // registry==null guards: the machine may have been resetForReuse()'d
+                    // (returned to pool) after this timeout was scheduled but before it fired.
+                    // Without these checks the stale timeout drives transitionTo() on a reset
+                    // machine → "registry became null mid-transition" WARN on every concurrent
+                    // teardown. registry is volatile, so this read sees the reset.
                     synchronized (this) {
-                        if (terminated || !currentState.equals(next.name())) return;
+                        if (terminated || registry == null || !currentState.equals(next.name())) return;
                     }
                     fire(new TimeoutEvent(next.name(), to.targetState()));
                     synchronized (this) {
-                        if (currentState.equals(next.name())) {
+                        if (registry != null && currentState.equals(next.name())) {
                             transitionTo(to.targetState());
                         }
                     }

@@ -342,6 +342,18 @@ public class Registry implements Machine.MachineRegistryHandle {
         }
         Supervisor<?> supervisor = (Supervisor<?>) sup;
         chainSubmit(cellKey(parentId, supervisorName), () -> {
+            // Drop a late event for a supervisor that was reset/returned-to-pool (or replaced
+            // by a new call on the same id) between submit and execution. Events are queued on
+            // the cell's serial chain; a terminal event can run resetForReuse() (nulls registry)
+            // while a later event is still queued — without this guard that queued handleInbound
+            // hits a reset supervisor and getOwningRegistry() throws "not bound to a flat
+            // Registry" (benign but fires on ~every concurrent teardown). registry is volatile.
+            if (supervisor.getRegistry() == null || supervisorOf(parentId) != supervisor) {
+                if (LOG.isDebugEnabled())
+                    LOG.debug("[{}] dropping late event {} for reset/replaced supervisor id={}",
+                        name, event.getClass().getSimpleName(), parentId);
+                return;
+            }
             try { supervisor.handleInbound(event); }
             catch (Throwable t) {
                 LOG.warn("[{}] supervisor.handleInbound threw for id={}: {}",

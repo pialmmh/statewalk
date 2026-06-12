@@ -448,7 +448,11 @@ public abstract class Machine<C> implements Poolable {
         this.currentDeadlineMs = deadlineMs;          // remembered so a later .stay() re-persists with the same deadline
         this.currentTimeoutTarget = timeoutTarget;
         if (registry == null) {
-            LOG.warn("transitionTo: registry became null mid-transition for {} state={}", machineId, next.name());
+            // Benign concurrent-reset bail: resetForReuse() nulled the registry while this
+            // transition was in flight (the machine is being torn down / returned to the pool).
+            // The state's onEntry already ran above; we just skip the registry post-transition
+            // bookkeeping. Proven harmless under load (settlement still reconciles), so DEBUG.
+            LOG.debug("transitionTo: registry became null mid-transition for {} state={} (machine reset concurrently — skipping registry notify)", machineId, next.name());
             return;
         }
         registry.onStateTransitioned(machineId, next.name(), deadlineMs, timeoutTarget);

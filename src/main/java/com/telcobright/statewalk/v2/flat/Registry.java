@@ -801,7 +801,7 @@ public class Registry implements Machine.MachineRegistryHandle {
             m.setTypeName(typeName);
             if (t.volatileLoader() != null) m.setVolatileContextLoader(t.volatileLoader());
             if (task != null) ((Machine) m).setInitialContext(task);
-            LOG.info("[{}] borrowAndStart: id={} type={} registrySet={} idle={}",
+            LOG.debug("[{}] borrowAndStart: id={} type={} registrySet={} idle={}",
                 name, id, typeName, m.getRegistry() != null, m.isIdle());
         }
 

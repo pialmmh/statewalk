@@ -135,6 +135,13 @@ public class Registry implements Machine.MachineRegistryHandle {
     private final QuotaLimits quotaLimits;
     private final QuotaController quotaController = new QuotaController();
     private final ConcurrentHashMap<String, QuotaKeys> dispatchQuotaKeys = new ConcurrentHashMap<>();
+    /**
+     * Serialises every quota bookkeeping step that touches MORE than one counter
+     * as a unit — a rebind (release old + acquire new + remember), the terminal
+     * release, the restore re-acquire. Dispatch's single tryAcquire stays lock-
+     * free (the controller's counters are atomic on their own).
+     */
+    private final Object quotaLock = new Object();
 
     /** Optional protocol channel — state actions reach the wire through this. */
     private final Channel<?, ?> channel;
@@ -254,14 +261,115 @@ public class Registry implements Machine.MachineRegistryHandle {
         if (quotaReject != null) {
             return DispatchResult.rejected(quotaReject);
         }
+        // Remember the keys BEFORE the cell becomes visible in {@code active}: a
+        // rebindQuotaKeys() arriving the instant dispatch returns must see them.
+        if (!isNone(keys)) dispatchQuotaKeys.put(parentId, keys);
         Machine<?> sup = borrowAndStart(supervisorName, parentId, task);
         if (sup == null) {
-            quotaController.release(keys);
+            synchronized (quotaLock) {
+                dispatchQuotaKeys.remove(parentId);
+                quotaController.release(keys);
+            }
             return DispatchResult.rejected(RejectCause.POOL_INTEGRITY_ERROR);
         }
-        if (keys != QuotaKeys.NONE) dispatchQuotaKeys.put(parentId, keys);
         scheduleGlobalTimeout(parentId);
         return DispatchResult.ok();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Quota rebind — the ratified base extension (wifi: a MAC is anonymous
+    // at birth; the user = the quota key binds at first login)
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Atomically swap the quota keys a live request holds: release the keys it
+     * acquired at dispatch (or at its last rebind), then {@code tryAcquire} the
+     * new ones against this registry's {@link QuotaLimits}. One decision, both
+     * dimensions — either the request ends up holding exactly {@code newKeys},
+     * or it keeps exactly its old keys.
+     *
+     * <ul>
+     *   <li>Returns {@code null} on success; the {@link RejectCause} of the first
+     *       failing dimension otherwise. On failure every partial acquire is rolled
+     *       back and the OLD keys are re-taken, so the counters are exact either way.</li>
+     *   <li>Synchronous — the caller renders the reject (e.g. a device-limit page)
+     *       from the return value.</li>
+     *   <li>Idempotent — rebinding to the keys already held is a no-op success.</li>
+     *   <li>Terminal release (when the supervisor reaches a final state) releases
+     *       whatever keys are held at that moment — the rebound ones.</li>
+     *   <li>Restore fidelity is the caller's: the {@code quotaKeysExtractor} reads the
+     *       context, so put the bound identity INTO the context (a {@code .stay()}
+     *       re-persists it) and a restart re-acquires the rebound keys.</li>
+     * </ul>
+     *
+     * @param machineId the request id (the supervisor's id, never a child id)
+     * @param newKeys   the keys to hold from now on; {@code null} = {@link QuotaKeys#NONE}
+     * @return {@code null} when the request now holds {@code newKeys}; the reject cause otherwise
+     * @throws IllegalStateException if no live request has this id (terminated, unknown, or a child id)
+     */
+    public RejectCause rebindQuotaKeys(String machineId, QuotaKeys newKeys) {
+        QuotaKeys wanted = newKeys != null ? newKeys : QuotaKeys.NONE;
+        synchronized (quotaLock) {
+            if (supervisorOf(machineId) == null) {
+                throw new IllegalStateException(
+                    "[" + name + "] rebindQuotaKeys: no live request with id=" + machineId);
+            }
+            QuotaKeys old = dispatchQuotaKeys.getOrDefault(machineId, QuotaKeys.NONE);
+            if (old.equals(wanted)) return null;                       // idempotent
+
+            quotaController.release(old);                              // NONE → no-op
+            RejectCause reject = quotaController.tryAcquire(wanted, quotaLimits);
+            if (reject != null) {
+                quotaController.acquireUnchecked(old, quotaLimits);    // put the old slots back
+                LOG.info("[{}] rebindQuotaKeys rejected id={} {} → {}: {} (old keys kept)",
+                    name, machineId, old, wanted, reject);
+                return reject;
+            }
+            if (isNone(wanted)) dispatchQuotaKeys.remove(machineId);
+            else dispatchQuotaKeys.put(machineId, wanted);
+            LOG.debug("[{}] rebindQuotaKeys id={} {} → {}", name, machineId, old, wanted);
+            return null;
+        }
+    }
+
+    /** The quota keys a live request currently holds ({@link QuotaKeys#NONE} if none / unknown). */
+    public QuotaKeys quotaKeysOf(String machineId) {
+        return dispatchQuotaKeys.getOrDefault(machineId, QuotaKeys.NONE);
+    }
+
+    /** Live concurrent count for a partner key (0 if never seen or the dimension is not enforced). */
+    public int quotaPartnerActive(String partnerKey) { return quotaController.partnerActive(partnerKey); }
+
+    /** Live concurrent count for a route key (0 if never seen or the dimension is not enforced). */
+    public int quotaRouteActive(String routeKey) { return quotaController.routeActive(routeKey); }
+
+    private static boolean isNone(QuotaKeys k) {
+        return k == null || (k.partnerKey() == null && k.routeKey() == null);
+    }
+
+    /**
+     * Restore-path quota re-acquire (the other half of the ratified extension).
+     * A restored supervisor held its slots before the restart; without this the
+     * counters restart at zero and the caps under-count until the machine ends.
+     * Unchecked on purpose: a live session is never rejected on restore because a
+     * cap was lowered in between — the counters must tell the truth.
+     */
+    private void reacquireQuotaOnRestore(String parentId, Object restoredCtx) {
+        if (quotaKeysExtractor == null || restoredCtx == null || !quotaLimits.enforces()) return;
+        QuotaKeys keys;
+        try { keys = quotaKeysExtractor.apply(restoredCtx); }
+        catch (RuntimeException e) {
+            LOG.warn("[{}] restore: quotaKeysExtractor threw for id={}: {} — no quota re-acquired",
+                name, parentId, e.toString());
+            return;
+        }
+        if (isNone(keys)) return;
+        synchronized (quotaLock) {
+            if (dispatchQuotaKeys.containsKey(parentId)) return;       // already accounted (defensive)
+            quotaController.acquireUnchecked(keys, quotaLimits);
+            dispatchQuotaKeys.put(parentId, keys);
+        }
+        LOG.debug("[{}] restore: quota re-acquired for id={} keys={}", name, parentId, keys);
     }
 
     private void scheduleGlobalTimeout(String parentId) {
@@ -755,6 +863,10 @@ public class Registry implements Machine.MachineRegistryHandle {
         Object ctx = SnapshotSerializer.contextFromBase64Json(
             snap.contextJsonBase64(), snap.contextClassName());
 
+        // Quota slots come back with the supervisor — before the cell is visible,
+        // so a terminal release (matured timeout) or a rebind always finds them.
+        if (typeName.equals(supervisorName)) reacquireQuotaOnRestore(parentId, ctx);
+
         active.computeIfAbsent(parentId, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(m);
 
         final Machine machine = m;
@@ -897,8 +1009,10 @@ public class Registry implements Machine.MachineRegistryHandle {
             }
             active.remove(parentId);
             cancelGlobalTimeout(parentId);
-            QuotaKeys keys = dispatchQuotaKeys.remove(parentId);
-            if (keys != null) quotaController.release(keys);
+            synchronized (quotaLock) {
+                QuotaKeys keys = dispatchQuotaKeys.remove(parentId);
+                if (keys != null) quotaController.release(keys);
+            }
         } else if (list.isEmpty()) {
             active.remove(parentId);
         }

@@ -101,6 +101,29 @@ public final class QuotaController {
     }
 
     /**
+     * Take the concurrent slots for {@code keys} WITHOUT checking limits or
+     * TPS. Two callers, both restoring a truth that already exists:
+     * <ul>
+     *   <li>startup / lazy rehydration — a restored machine already held its
+     *       slots before the restart, so the counters must reflect it again
+     *       (never reject a live session because a cap was lowered meanwhile);</li>
+     *   <li>{@code rebindQuotaKeys} rollback — the old keys were released a
+     *       moment ago and must come back exactly when the new ones fail.</li>
+     * </ul>
+     * Mirrors {@link #tryAcquire}'s gating: a dimension whose cap is {@code 0}
+     * is not counted (so a later {@link #release} stays balanced).
+     */
+    public void acquireUnchecked(QuotaKeys keys, QuotaLimits limits) {
+        if (keys == null || limits == null || !limits.enforces()) return;
+        if (limits.maxConcurrentPerPartner() > 0 && keys.partnerKey() != null) {
+            partnerActive.computeIfAbsent(keys.partnerKey(), k -> new AtomicInteger(0)).incrementAndGet();
+        }
+        if (limits.maxConcurrentPerRoute() > 0 && keys.routeKey() != null) {
+            routeActive.computeIfAbsent(keys.routeKey(), k -> new AtomicInteger(0)).incrementAndGet();
+        }
+    }
+
+    /**
      * Release concurrent counts when a machine terminates. TPS doesn't need
      * release — it's window-based.
      */

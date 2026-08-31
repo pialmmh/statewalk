@@ -89,8 +89,10 @@ class TypedRegistryAndResetHookTest {
 
     @Test
     void typed_registry_needs_no_casts_anywhere() throws Exception {
+        int cacheBefore = com.telcobright.statewalk.persistence.SnapshotSerializer.classCacheSize();
         StatemachineRegistry<CallTask> reg = StatemachineRegistry.<CallTask>builder("typed")
             .supervisor("StatefulSupervisor", StatefulSupervisor::new, 4)
+            .preWarmContextClass(CallTask.class)   // v2 build-time param, carried over
             .resetHook("StatefulSupervisor", m -> {
                 StatefulSupervisor s = (StatefulSupervisor) m;
                 s.scratch = null;
@@ -118,6 +120,10 @@ class TypedRegistryAndResetHookTest {
         Machine<?> m = reg.findInternal("t-4", "StatefulSupervisor");
         assertNotNull(m);
         assertEquals("p-t-4", ((CallTask) m.getContext()).partner);
+
+        assertTrue(com.telcobright.statewalk.persistence.SnapshotSerializer.classCacheSize() > cacheBefore
+                || cacheBefore > 0,
+            "preWarmContextClass registered the context class in the serializer cache");
     }
 
     // ─────────────────────────────────────────────────────────────

@@ -1680,6 +1680,19 @@ public final class StatemachineRegistry<T> {
         }
 
         /**
+         * Pre-warm the snapshot serializer's class cache so the very FIRST
+         * rehydration after a cold start (prior snapshots in the store, cache
+         * empty) avoids the one-time {@code Class.forName} per context class.
+         * Optional — the cache auto-warms on every save anyway; register the
+         * supervisor context class (and child context classes) of any registry
+         * that rehydrates. Carried over from the v2 builder.
+         */
+        public Builder<T> preWarmContextClass(Class<?>... contextClasses) {
+            for (Class<?> c : contextClasses) SnapshotSerializer.registerContextClass(c);
+            return this;
+        }
+
+        /**
          * Per-machine-type volatile loader, addressed by the type's
          * {@code name}. Fires on both creation and rehydration.
          */

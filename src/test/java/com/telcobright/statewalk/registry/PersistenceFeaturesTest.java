@@ -78,8 +78,8 @@ class PersistenceFeaturesTest {
             .build();
     }
 
-    private static Registry build(String name, InMemoryPersistenceProvider store) {
-        return Registry.builder(name)
+    private static StatemachineRegistry<SessCtx> build(String name, InMemoryPersistenceProvider store) {
+        return StatemachineRegistry.<SessCtx>builder(name)
             .supervisor(sessionSpec(), 16)
             .persistence(store).rehydrate(true).threads(4)
             .build();
@@ -89,7 +89,7 @@ class PersistenceFeaturesTest {
     @Test
     void stay_event_is_persisted_and_survives_failover() throws Exception {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry a = build("sess", store);
+        StatemachineRegistry<SessCtx> a = build("sess", store);
         String id = "s-stay";
         a.dispatch(id, new SessCtx());
         assertTrue(a.awaitIdle(2, TimeUnit.SECONDS));
@@ -103,7 +103,7 @@ class PersistenceFeaturesTest {
         // Node A "dies" (we do NOT shut it down — that would delete snapshots).
         // A fresh node B takes over the same store and must resume the request
         // with the .stay() mutations intact.
-        Registry b = build("sess", store);
+        StatemachineRegistry<SessCtx> b = build("sess", store);
         try {
             assertTrue(b.awaitIdle(3, TimeUnit.SECONDS));
             Machine<?> resumed = b.findInternal(id, "Session");
@@ -117,7 +117,7 @@ class PersistenceFeaturesTest {
     @Test
     void offline_state_suspends_and_rehydrates_on_event() throws Exception {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry reg = build("sess-off", store);
+        StatemachineRegistry<SessCtx> reg = build("sess-off", store);
         try {
             String id = "s-off";
             reg.dispatch(id, new SessCtx());
@@ -142,7 +142,7 @@ class PersistenceFeaturesTest {
     @Test
     void offline_state_without_persistence_is_rejected_at_build() {
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
-            Registry.builder("sess-nopersist").supervisor(sessionSpec(), 4).build());
+            StatemachineRegistry.<SessCtx>builder("sess-nopersist").supervisor(sessionSpec(), 4).build());
         assertTrue(ex.getMessage().toLowerCase().contains("offline"), ex.getMessage());
     }
 
@@ -150,7 +150,7 @@ class PersistenceFeaturesTest {
     @Test
     void failover_resumes_all_unfinished_on_a_fresh_node() throws Exception {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry nodeA = build("calls", store);
+        StatemachineRegistry<SessCtx> nodeA = build("calls", store);
         final int N = 25;
         for (int i = 0; i < N; i++) nodeA.dispatch("call-" + i, new SessCtx());
         assertTrue(nodeA.awaitIdle(5, TimeUnit.SECONDS));
@@ -158,7 +158,7 @@ class PersistenceFeaturesTest {
         assertEquals(N, store.size(), "every in-flight call persisted to the shared store");
 
         // Node A crashes (NOT shut down). External supervisor launches node B on the same store.
-        Registry nodeB = build("calls", store);
+        StatemachineRegistry<SessCtx> nodeB = build("calls", store);
         try {
             assertTrue(nodeB.awaitIdle(5, TimeUnit.SECONDS));
             assertEquals(N, nodeB.activeCellCount(), "fresh node resumed every in-flight call from the store");
@@ -176,7 +176,7 @@ class PersistenceFeaturesTest {
     void multiple_final_states_both_reachable() throws Exception {
         SUCCESSES.set(0); FAILURES.set(0);
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry reg = build("sess-final", store);
+        StatemachineRegistry<SessCtx> reg = build("sess-final", store);
         try {
             reg.dispatch("ok", new SessCtx());
             reg.dispatch("bad", new SessCtx());

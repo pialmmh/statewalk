@@ -60,12 +60,12 @@ class RegistryHardeningV3Test {
 
     public static class Ctx { public String partner; public int touches; public Ctx() {} }
 
-    private final List<Registry> open = new ArrayList<>();
+    private final List<StatemachineRegistry<Ctx>> open = new ArrayList<>();
 
     @AfterEach
-    void tearDown() { for (Registry r : open) r.shutdown(); }
+    void tearDown() { for (StatemachineRegistry<Ctx> r : open) r.shutdown(); }
 
-    private Registry track(Registry r) { open.add(r); return r; }
+    private StatemachineRegistry<Ctx> track(StatemachineRegistry<Ctx> r) { open.add(r); return r; }
 
     // ── graph helpers ───────────────────────────────────────────────
 
@@ -119,7 +119,7 @@ class RegistryHardeningV3Test {
     @Test
     void supervisor_terminal_cascade_reclaims_live_children_exactly() throws Exception {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry reg = track(Registry.builder("v3-cascade")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-cascade")
             .supervisor(spawningSupervisor(), 4)
             .child(MachineSpec.<Ctx>builder().name("A").contextFactory(Ctx::new).stateMap(childGraph()).build(), 4)
             .child(MachineSpec.<Ctx>builder().name("B").contextFactory(Ctx::new).stateMap(childGraph()).build(), 4)
@@ -157,7 +157,7 @@ class RegistryHardeningV3Test {
 
     @Test
     void request_id_reuse_immediately_after_finish_is_a_clean_new_session() throws Exception {
-        Registry reg = track(Registry.builder("v3-reuse")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-reuse")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Touch.class); r.selfHandle(Ping.class); })
@@ -189,7 +189,7 @@ class RegistryHardeningV3Test {
     @Test
     void late_event_for_finished_id_is_dropped_not_resurrected() throws Exception {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry reg = track(Registry.builder("v3-late")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-late")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Ping.class); r.selfHandle(Touch.class); })
@@ -234,7 +234,7 @@ class RegistryHardeningV3Test {
                 .onEntry(self -> expiredCount.incrementAndGet())
             .build();
 
-        Registry reg = track(Registry.builder("v3-staletimer")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-staletimer")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(counted)
                 .routes(r -> r.selfHandle(Stop.class))
@@ -288,7 +288,7 @@ class RegistryHardeningV3Test {
             .state("EXPIRED").finalState().timeout(1, TimeUnit.SECONDS, "EXPIRED")
             .build();
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry reg = track(Registry.builder("v3-suspendrace")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-suspendrace")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(suspendGraph)
                 .routes(r -> { r.selfHandle(Park.class); r.selfHandle(Touch.class); r.selfHandle(Stop.class); })
@@ -337,7 +337,7 @@ class RegistryHardeningV3Test {
             @Override public List<MachineSnapshot> loadAll(String mid) { return store.loadAll(mid); }
             @Override public void delete(String mid, String r) { store.delete(mid, r); }
         };
-        Registry reg = track(Registry.builder("v3-singleflight")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-singleflight")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Ping.class); r.selfHandle(Stop.class); r.selfHandle(Touch.class); })
@@ -379,7 +379,7 @@ class RegistryHardeningV3Test {
     @Test
     void global_timeout_survives_restart_via_persisted_deadline() throws Exception {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry a = track(Registry.builder("v3-gto")
+        StatemachineRegistry<Ctx> a = track(StatemachineRegistry.<Ctx>builder("v3-gto")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Ping.class); r.selfHandle(Touch.class); })
@@ -400,7 +400,7 @@ class RegistryHardeningV3Test {
 
         // Node B restores — v2 gave restored sessions eternal life; v3 re-arms
         // the persisted deadline, which has matured → the session is ended.
-        Registry b = track(Registry.builder("v3-gto")
+        StatemachineRegistry<Ctx> b = track(StatemachineRegistry.<Ctx>builder("v3-gto")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Ping.class); r.selfHandle(Touch.class); })
@@ -437,7 +437,7 @@ class RegistryHardeningV3Test {
                 throw new RuntimeException("simulated delete outage");
             }
         };
-        Registry a = track(Registry.builder("v3-tomb")
+        StatemachineRegistry<Ctx> a = track(StatemachineRegistry.<Ctx>builder("v3-tomb")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Ping.class); r.selfHandle(Touch.class); })
@@ -460,7 +460,7 @@ class RegistryHardeningV3Test {
         // "Restart" on the same store (deletes work again): the stranded FINAL
         // snapshot must be recognised as a tombstone — purged, never resurrected
         // (v2 re-ran the final state's entry action and re-took quota).
-        Registry b = track(Registry.builder("v3-tomb")
+        StatemachineRegistry<Ctx> b = track(StatemachineRegistry.<Ctx>builder("v3-tomb")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Ping.class); r.selfHandle(Touch.class); })
@@ -479,7 +479,7 @@ class RegistryHardeningV3Test {
 
     @Test
     void concurrency_rejected_dispatch_burns_no_tps_token() {
-        Registry reg = track(Registry.builder("v3-tpsburn")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-tpsburn")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Ping.class); r.selfHandle(Touch.class); })
@@ -524,7 +524,7 @@ class RegistryHardeningV3Test {
             })
             .build();
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
-            Registry.builder("v3-route-typo")
+            StatemachineRegistry.<Ctx>builder("v3-route-typo")
                 .supervisor(typo, 2)
                 .child(MachineSpec.<Ctx>builder().name("Signaling").contextFactory(Ctx::new)
                     .stateMap(childGraph()).build(), 2)
@@ -539,7 +539,7 @@ class RegistryHardeningV3Test {
     @Test
     void channel_inbound_is_wired_and_stops_at_shutdown() throws Exception {
         TestChannel<String, StatemachineEvent> ch = new TestChannel<>("wire");
-        Registry reg = track(Registry.builder("v3-channel")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-channel")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Touch.class); r.selfHandle(Ping.class); })
@@ -571,7 +571,7 @@ class RegistryHardeningV3Test {
 
     @Test
     void saturation_soak_loses_no_sessions_and_leaks_no_cells() throws Exception {
-        Registry reg = track(Registry.builder("v3-soak")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-soak")
             .supervisor(SupervisorSpec.<Ctx>builder()
                 .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
                 .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Touch.class); r.selfHandle(Ping.class); })

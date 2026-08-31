@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Persistence + rehydration + first-event semantics for flat.Registry.
+ * Persistence + rehydration + first-event semantics for flat.StatemachineRegistry.
  *
  * <p>Six scenarios:
  * <ol>
@@ -118,7 +118,7 @@ class FlatRegistryPersistenceTest {
 
     // ── fixtures ──────────────────────────────────────────────────────
 
-    private Registry reg;
+    private StatemachineRegistry<TestCtx> reg;
 
     @AfterEach
     void tearDown() {
@@ -132,7 +132,7 @@ class FlatRegistryPersistenceTest {
     @Test
     void persistence_saves_on_every_state_transition() throws InterruptedException {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        reg = Registry.builder("p-save")
+        reg = StatemachineRegistry.<TestCtx>builder("p-save")
             .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .persistence(store)
             .threads(2)
@@ -165,7 +165,7 @@ class FlatRegistryPersistenceTest {
     @Test
     void persistence_deletes_on_cell_termination() throws InterruptedException {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        reg = Registry.builder("p-del")
+        reg = StatemachineRegistry.<TestCtx>builder("p-del")
             .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .persistence(store)
             .threads(2)
@@ -191,7 +191,7 @@ class FlatRegistryPersistenceTest {
     @Test
     void volatile_loader_fires_on_creation() throws InterruptedException {
         AtomicInteger creates = new AtomicInteger();
-        reg = Registry.builder("p-vol")
+        reg = StatemachineRegistry.<TestCtx>builder("p-vol")
             .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .volatileLoader("TestSupervisor", m -> {
                 creates.incrementAndGet();
@@ -235,7 +235,7 @@ class FlatRegistryPersistenceTest {
             System.currentTimeMillis() + 60_000L));
 
         AtomicInteger loads = new AtomicInteger();
-        reg = Registry.builder("p-vol-rehy")
+        reg = StatemachineRegistry.<TestCtx>builder("p-vol-rehy")
             .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .persistence(store)
             .rehydrate(true)
@@ -276,13 +276,13 @@ class FlatRegistryPersistenceTest {
 
         ChildCtx childCtx = new ChildCtx();
         childCtx.wakeups = 3;
-        String childId = id + Registry.CHILD_ID_SEPARATOR + "TestChild";
+        String childId = id + StatemachineRegistry.CHILD_ID_SEPARATOR + "TestChild";
         store.save(new MachineSnapshot(
             childId, "p-multi", "WORKING",
             ChildCtx.class.getName(), SnapshotSerializer.contextToBase64Json(childCtx),
             now, "DONE", now + 60_000L));
 
-        reg = Registry.builder("p-multi")
+        reg = StatemachineRegistry.<TestCtx>builder("p-multi")
             .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .child("TestChild", TestChild::new, 2)
             .persistence(store)
@@ -311,7 +311,7 @@ class FlatRegistryPersistenceTest {
 
     @Test
     void first_event_auto_creates_supervisor() throws InterruptedException {
-        reg = Registry.builder("p-first")
+        reg = StatemachineRegistry.<TestCtx>builder("p-first")
             .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .createFromFirstEvent(ev -> {
                 if (ev instanceof InitCall init) {
@@ -341,7 +341,7 @@ class FlatRegistryPersistenceTest {
 
     @Test
     void unknown_id_non_first_event_throws() {
-        reg = Registry.builder("p-throw")
+        reg = StatemachineRegistry.<TestCtx>builder("p-throw")
             .supervisor("TestSupervisor", TestSupervisor::new, 2)
             .threads(2)
             .build();

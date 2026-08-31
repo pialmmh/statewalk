@@ -20,7 +20,7 @@ package com.telcobright.statewalk.event;
  * call, {@code SubmitSm} for an SMS). The registry uses this signal on
  * inbound dispatch to decide between creating a new machine and rehydrating
  * an existing one — see
- * {@link com.telcobright.statewalk.registry.Registry#onInboundEvent}.
+ * {@link com.telcobright.statewalk.registry.StatemachineRegistry#onInboundEvent}.
  *
  * <p>Implementations are typically:
  * <ul>

@@ -3,7 +3,7 @@ package com.telcobright.statewalk.registry;
 /**
  * Quota thresholds for a registry. {@code 0} on any field disables that
  * dimension's check. Provided to the registry via the
- * {@code Registry.getQuotaLimits()} subclass hook.
+ * {@code StatemachineRegistry.getQuotaLimits()} subclass hook.
  *
  * @param maxConcurrentPerPartner concurrent-machine ceiling per partner key
  * @param maxConcurrentPerRoute   concurrent-machine ceiling per route key

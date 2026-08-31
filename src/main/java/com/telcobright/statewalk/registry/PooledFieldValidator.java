@@ -13,7 +13,7 @@ import java.util.List;
  * subclass</strong>.
  *
  * <h2>Why this exists</h2>
- * Every machine in a {@link Registry} is borrowed from a pool, used for one
+ * Every machine in a {@link StatemachineRegistry} is borrowed from a pool, used for one
  * request, reset, and returned. {@link Machine#resetForReuse()} nulls
  * everything the framework owns — context, volatile context, ids, current
  * state, timeout future. What it cannot see is a field a subclass declared
@@ -69,10 +69,16 @@ final class PooledFieldValidator {
      * Throws {@link IllegalStateException} listing every leak-prone instance
      * field on {@code machineClass}. No-op when the type is clean.
      *
+     * <p>When the type has a builder-registered <b>reset hook</b>, mutable
+     * instance fields become legal — the hook owns clearing them on every
+     * pool return — so the check downgrades to an INFO log listing the fields
+     * the hook must cover.
+     *
      * @param typeName     the type's registered name (for the error message)
      * @param machineClass the concrete pooled class produced by the factory
+     * @param hasResetHook true when a reset hook is registered for the type
      */
-    static void validate(String typeName, Class<?> machineClass) {
+    static void validate(String typeName, Class<?> machineClass, boolean hasResetHook) {
         List<String> offenders = new ArrayList<>();
         for (Class<?> k = machineClass;
              k != null && k != Machine.class && k != Supervisor.class && k != Object.class;
@@ -87,6 +93,14 @@ final class PooledFieldValidator {
             }
         }
         if (offenders.isEmpty()) return;
+
+        if (hasResetHook) {
+            org.slf4j.LoggerFactory.getLogger(PooledFieldValidator.class).info(
+                "Machine type '{}' declares mutable instance field(s) {} — allowed because a reset "
+                + "hook is registered; the hook MUST clear every one of them on pool return.",
+                typeName, offenders);
+            return;
+        }
 
         throw new IllegalStateException(
             "Machine type '" + typeName + "' (" + machineClass.getName() + ") declares mutable "

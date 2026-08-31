@@ -36,7 +36,7 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * THE statewalk registry — one Registry per domain (call / sms / http / wifi).
+ * THE statewalk registry — one StatemachineRegistry per domain (call / sms / http / wifi).
  * Hosts machines of multiple types for one request id at once: position 0 of
  * each row is the {@link Supervisor}; positions 1+ are children spawned by
  * that supervisor through its resolver.
@@ -93,9 +93,9 @@ import java.util.function.Supplier;
  * </ul>
  * Stable, debuggable, friendly to persistence (single-column key).
  */
-public final class Registry {
+public final class StatemachineRegistry<T> {
 
-    private static final Logger LOG = LoggerFactory.getLogger(Registry.class);
+    private static final Logger LOG = LoggerFactory.getLogger(StatemachineRegistry.class);
 
     public static final String CHILD_ID_SEPARATOR = "#";
 
@@ -123,7 +123,7 @@ public final class Registry {
     enum CellPhase { LIVE, TERMINATING, SUSPENDING }
 
     static final class Cell {
-        final Registry reg;
+        final StatemachineRegistry<?> reg;
         final String parentId;
         final String typeName;
         final String machineId;
@@ -133,7 +133,7 @@ public final class Registry {
         final CopyOnWriteArrayList<Cell> row;
         final AtomicReference<CellPhase> phase = new AtomicReference<>(CellPhase.LIVE);
 
-        Cell(Registry reg, String parentId, String typeName, String machineId,
+        Cell(StatemachineRegistry<?> reg, String parentId, String typeName, String machineId,
              Machine<?> machine, CopyOnWriteArrayList<Cell> row) {
             this.reg = reg;
             this.parentId = parentId;
@@ -209,7 +209,7 @@ public final class Registry {
      * {@code isFirst() == true} arrives for an unknown id, this function is
      * called to construct the initial context for the supervisor.
      */
-    private final Function<StatemachineEvent, Object> firstEventToContext;
+    private final Function<StatemachineEvent, T> firstEventToContext;
 
     /** Hard ceiling on concurrent supervisor cells; 0 disables. */
     private final int maxConcurrent;
@@ -225,7 +225,7 @@ public final class Registry {
     private final AtomicLong dispatchCounter = new AtomicLong(0);
 
     /** Per-task quota-key extractor + limit thresholds. */
-    private final Function<Object, QuotaKeys> quotaKeysExtractor;
+    private final Function<T, QuotaKeys> quotaKeysExtractor;
     private final QuotaLimits quotaLimits;
     private final QuotaController quotaController = new QuotaController();
     private final ConcurrentHashMap<String, QuotaKeys> dispatchQuotaKeys = new ConcurrentHashMap<>();
@@ -240,7 +240,7 @@ public final class Registry {
     /** Optional protocol channel — state actions reach the wire through this. */
     private final Channel<?, ?> channel;
 
-    private Registry(Builder b) {
+    private StatemachineRegistry(Builder<T> b) {
         this.name = b.name;
         this.supervisorName = b.supervisorName;
         this.types = Map.copyOf(b.types);
@@ -268,7 +268,7 @@ public final class Registry {
         Map<String, StateMap> graphs = new LinkedHashMap<>();
         types.forEach((typeName, t) -> {
             Machine<?> sample = t.factory().get();
-            PooledFieldValidator.validate(typeName, sample.getClass());
+            PooledFieldValidator.validate(typeName, sample.getClass(), t.resetHook() != null);
             StateMap graph = sample.peekStateMap();
             graphs.put(typeName, graph);
             if (persistence == null && graph.hasOfflineState()) {
@@ -365,13 +365,15 @@ public final class Registry {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private ObjectPoolManager<? extends Machine<?>> makePool(String typeName, RegistryType t) {
+        java.util.function.Consumer<Machine<?>> hook = t.resetHook();
         return new ObjectPoolManager(
             name + "-" + typeName,
             (Supplier) t.factory(),
-            t.poolSize());
+            t.poolSize(),
+            hook != null ? (java.util.function.Consumer) hook : null);
     }
 
-    public static Builder builder(String name) { return new Builder(name); }
+    public static <T> Builder<T> builder(String name) { return new Builder<>(name); }
 
     public String getName() { return name; }
 
@@ -389,7 +391,7 @@ public final class Registry {
      * CAPACITY → QUOTA → POOL_INTEGRITY}. Each gate is cheap and
      * short-circuits; every failure path unwinds exactly what it took.
      */
-    public DispatchResult dispatch(String parentId, Object task) {
+    public DispatchResult dispatch(String parentId, T task) {
         if (shuttingDown.get()) return DispatchResult.rejected(RejectCause.SHUTTING_DOWN);
 
         // Atomic id claim — two concurrent dispatches of one id can never both
@@ -559,10 +561,11 @@ public final class Registry {
      * session is never rejected on restore because a cap was lowered in
      * between — the counters must tell the truth.
      */
+    @SuppressWarnings("unchecked")
     private void reacquireQuotaOnRestore(String parentId, Object restoredCtx) {
         if (quotaKeysExtractor == null || restoredCtx == null || !quotaLimits.enforces()) return;
         QuotaKeys keys;
-        try { keys = quotaKeysExtractor.apply(restoredCtx); }
+        try { keys = quotaKeysExtractor.apply((T) restoredCtx); }
         catch (RuntimeException e) {
             LOG.warn("[{}] restore: quotaKeysExtractor threw for id={}: {} — no quota re-acquired",
                 name, parentId, e.toString());
@@ -665,7 +668,7 @@ public final class Registry {
         if (supCell == null) {
             // First-event auto-creation path.
             if (event.isFirst() && firstEventToContext != null) {
-                Object initialCtx = firstEventToContext.apply(event);
+                T initialCtx = firstEventToContext.apply(event);
                 if (initialCtx != null) {
                     dispatch(parentId, initialCtx);
                     supCell = supervisorCell(parentId);
@@ -956,9 +959,9 @@ public final class Registry {
      * re-populated with a NEW cell.
      */
     static final class PerMachineHandle implements Machine.MachineRegistryHandle {
-        final Registry reg;
+        final StatemachineRegistry<?> reg;
         final Cell cell;
-        PerMachineHandle(Registry reg, Cell cell) {
+        PerMachineHandle(StatemachineRegistry<?> reg, Cell cell) {
             this.reg = reg; this.cell = cell;
         }
         /**
@@ -985,8 +988,8 @@ public final class Registry {
             reg.onCellWentOffline(cell);
         }
 
-        /** Supervisor uses this to reach back into the owning Registry. */
-        Registry registry() { return reg; }
+        /** Supervisor uses this to reach back into the owning StatemachineRegistry. */
+        StatemachineRegistry<?> registry() { return reg; }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1572,30 +1575,31 @@ public final class Registry {
     // Inner types
     // ─────────────────────────────────────────────────────────────────
 
-    /** Per-type registration: factory + pool size + optional volatile loader. */
+    /** Per-type registration: factory + pool size + optional volatile loader + optional reset hook. */
     record RegistryType(
         Supplier<? extends Machine<?>> factory,
         int poolSize,
-        Function<Machine<?>, Object> volatileLoader
+        Function<Machine<?>, Object> volatileLoader,
+        java.util.function.Consumer<Machine<?>> resetHook
     ) {}
 
     // ─────────────────────────────────────────────────────────────────
-    // Builder — the ONLY way to construct a Registry
+    // Builder — the ONLY way to construct a StatemachineRegistry
     // ─────────────────────────────────────────────────────────────────
 
-    public static final class Builder {
+    public static final class Builder<T> {
         private final String name;
         private String supervisorName;
         private final Map<String, RegistryType> types = new LinkedHashMap<>();
         private int threads = 2;
         private PersistenceProvider persistence;
         private boolean rehydrateEnabled;
-        private Function<StatemachineEvent, Object> firstEventToContext;
+        private Function<StatemachineEvent, T> firstEventToContext;
         private int maxConcurrent = 0;
         private long globalTimeoutMs = 0;
         private String globalTimeoutTargetState;
         private int debugSampleRate = 0;
-        private Function<Object, QuotaKeys> quotaKeysExtractor;
+        private Function<T, QuotaKeys> quotaKeysExtractor;
         private QuotaLimits quotaLimits = QuotaLimits.UNLIMITED;
         private Channel<?, ?> channel;
         private BiFunction<String, Object, StatemachineEvent> channelDecoder;
@@ -1605,21 +1609,21 @@ public final class Registry {
 
         // ── Spec-based registration (primary API) ─────────────────────
 
-        /** Register the supervisor via a {@link SupervisorSpec}. */
-        public <C> Builder supervisor(SupervisorSpec<C> spec, int poolSize) {
+        /** Register the supervisor via a {@link SupervisorSpec} — its context type IS the registry's {@code T}. */
+        public Builder<T> supervisor(SupervisorSpec<T> spec, int poolSize) {
             requireUnique(spec.name());
             this.supervisorName = spec.name();
             this.types.put(spec.name(),
-                new RegistryType(() -> new SpecBackedSupervisor<>(spec), poolSize, null));
+                new RegistryType(() -> new SpecBackedSupervisor<>(spec), poolSize, null, null));
             return this;
         }
 
-        /** Register a child machine type via a {@link MachineSpec}. */
-        public <C> Builder child(MachineSpec<C> spec, int poolSize) {
+        /** Register a child machine type via a {@link MachineSpec} (children keep their own context types). */
+        public <C> Builder<T> child(MachineSpec<C> spec, int poolSize) {
             requireSupervisorFirst();
             requireUnique(spec.name());
             this.types.put(spec.name(),
-                new RegistryType(() -> new SpecBackedMachine<>(spec), poolSize, null));
+                new RegistryType(() -> new SpecBackedMachine<>(spec), poolSize, null, null));
             return this;
         }
 
@@ -1629,10 +1633,10 @@ public final class Registry {
          * Register the supervisor with a raw factory + name. Use when a custom
          * {@code Supervisor} subclass is needed (otherwise prefer {@link #supervisor(SupervisorSpec, int)}).
          */
-        public Builder supervisor(String typeName, Supplier<? extends Supervisor<?>> factory, int poolSize) {
+        public Builder<T> supervisor(String typeName, Supplier<? extends Supervisor<T>> factory, int poolSize) {
             requireUnique(typeName);
             this.supervisorName = typeName;
-            this.types.put(typeName, new RegistryType(factory, poolSize, null));
+            this.types.put(typeName, new RegistryType(factory, poolSize, null, null));
             return this;
         }
 
@@ -1641,10 +1645,10 @@ public final class Registry {
          * custom {@code Machine} subclass is needed (otherwise prefer
          * {@link #child(MachineSpec, int)}).
          */
-        public Builder child(String typeName, Supplier<? extends Machine<?>> factory, int poolSize) {
+        public Builder<T> child(String typeName, Supplier<? extends Machine<?>> factory, int poolSize) {
             requireSupervisorFirst();
             requireUnique(typeName);
-            this.types.put(typeName, new RegistryType(factory, poolSize, null));
+            this.types.put(typeName, new RegistryType(factory, poolSize, null, null));
             return this;
         }
 
@@ -1663,14 +1667,14 @@ public final class Registry {
             }
         }
 
-        public Builder threads(int n) { this.threads = n; return this; }
+        public Builder<T> threads(int n) { this.threads = n; return this; }
 
-        public Builder persistence(PersistenceProvider provider) {
+        public Builder<T> persistence(PersistenceProvider provider) {
             this.persistence = provider;
             return this;
         }
 
-        public Builder rehydrate(boolean enabled) {
+        public Builder<T> rehydrate(boolean enabled) {
             this.rehydrateEnabled = enabled;
             return this;
         }
@@ -1679,24 +1683,47 @@ public final class Registry {
          * Per-machine-type volatile loader, addressed by the type's
          * {@code name}. Fires on both creation and rehydration.
          */
-        public Builder volatileLoader(String typeName, Function<Machine<?>, Object> loader) {
+        public Builder<T> volatileLoader(String typeName, Function<Machine<?>, Object> loader) {
             RegistryType existing = types.get(typeName);
             if (existing == null) {
                 throw new IllegalStateException(
                     "volatileLoader: machine type not registered: " + typeName);
             }
-            types.put(typeName, new RegistryType(existing.factory(), existing.poolSize(), loader));
+            types.put(typeName, new RegistryType(existing.factory(), existing.poolSize(), loader, existing.resetHook()));
             return this;
         }
 
-        public Builder createFromFirstEvent(Function<StatemachineEvent, Object> fn) {
+        /**
+         * Per-machine-type reset hook, addressed by the type's {@code name} —
+         * the pool-return lambda. Runs every time an instance of the type goes
+         * back to the pool, AFTER the framework reset, receiving the machine:
+         * clear custom props, empty final-field collections/caches, release
+         * per-borrow handles. A throw drops the instance from the pool (it is
+         * never recycled dirty).
+         *
+         * <p>Registering a reset hook also RELAXES the pooled-field validator
+         * for the type: mutable instance props become legal because THIS
+         * lambda now owns clearing them (the fields are listed at build in an
+         * INFO log so the hook's coverage can be reviewed).
+         */
+        public Builder<T> resetHook(String typeName, java.util.function.Consumer<Machine<?>> hook) {
+            RegistryType existing = types.get(typeName);
+            if (existing == null) {
+                throw new IllegalStateException(
+                    "resetHook: machine type not registered: " + typeName);
+            }
+            types.put(typeName, new RegistryType(existing.factory(), existing.poolSize(), existing.volatileLoader(), hook));
+            return this;
+        }
+
+        public Builder<T> createFromFirstEvent(Function<StatemachineEvent, T> fn) {
             this.firstEventToContext = fn;
             return this;
         }
 
-        public Builder maxConcurrent(int n) { this.maxConcurrent = n; return this; }
+        public Builder<T> maxConcurrent(int n) { this.maxConcurrent = n; return this; }
 
-        public Builder globalTimeout(long duration, TimeUnit unit, String targetState) {
+        public Builder<T> globalTimeout(long duration, TimeUnit unit, String targetState) {
             if (duration <= 0) throw new IllegalArgumentException("duration must be > 0");
             if (targetState == null) throw new IllegalArgumentException("targetState required");
             this.globalTimeoutMs = unit.toMillis(duration);
@@ -1704,14 +1731,14 @@ public final class Registry {
             return this;
         }
 
-        public Builder debugSampleRate(int n) { this.debugSampleRate = n; return this; }
+        public Builder<T> debugSampleRate(int n) { this.debugSampleRate = n; return this; }
 
-        public Builder quotaKeysExtractor(Function<Object, QuotaKeys> extractor) {
+        public Builder<T> quotaKeysExtractor(Function<T, QuotaKeys> extractor) {
             this.quotaKeysExtractor = extractor;
             return this;
         }
 
-        public Builder quotaLimits(QuotaLimits limits) {
+        public Builder<T> quotaLimits(QuotaLimits limits) {
             this.quotaLimits = limits != null ? limits : QuotaLimits.UNLIMITED;
             return this;
         }
@@ -1724,7 +1751,7 @@ public final class Registry {
          * protocol frame, use {@link #channel(Channel, BiFunction)} with a
          * decoder.
          */
-        public Builder channel(Channel<?, ?> channel) { this.channel = channel; return this; }
+        public Builder<T> channel(Channel<?, ?> channel) { this.channel = channel; return this; }
 
         /**
          * Bind the protocol channel with a decoder mapping the channel's raw
@@ -1732,7 +1759,7 @@ public final class Registry {
          * from the decoder to ignore a frame.
          */
         @SuppressWarnings("unchecked")
-        public <I> Builder channel(Channel<?, I> channel, BiFunction<String, I, StatemachineEvent> decoder) {
+        public <I> Builder<T> channel(Channel<?, I> channel, BiFunction<String, I, StatemachineEvent> decoder) {
             this.channel = channel;
             this.channelDecoder = (BiFunction<String, Object, StatemachineEvent>) (BiFunction<?, ?, ?>) decoder;
             return this;
@@ -1743,13 +1770,13 @@ public final class Registry {
          * submissions are shed with a failed ack (backpressure at the entry,
          * never inside the cell chains). Default 10 000.
          */
-        public Builder maxPendingInbound(int n) {
+        public Builder<T> maxPendingInbound(int n) {
             if (n <= 0) throw new IllegalArgumentException("maxPendingInbound must be > 0");
             this.maxPendingInbound = n;
             return this;
         }
 
-        public Registry build() {
+        public StatemachineRegistry<T> build() {
             if (supervisorName == null) {
                 throw new IllegalStateException("No supervisor declared — call .supervisor(...) first");
             }
@@ -1761,7 +1788,7 @@ public final class Registry {
                 throw new IllegalStateException(
                     "quotaLimits enforced but no quotaKeysExtractor — keys cannot be derived");
             }
-            return new Registry(this);
+            return new StatemachineRegistry<>(this);
         }
     }
 }

@@ -38,16 +38,24 @@ data sessions — anything that lives, times out, and must leave a record).
   state first). Domain hooks run as transition actions, exception-shielded: a hook throw can
   neither drop an event nor flip an outcome, and a `buildSdr` crash still ships the envelope.
 
-Construction is **builder-only** everywhere: `Registry.builder(name)…build()`,
-`SupervisorSpec.builder()`, `MachineSpec.builder()`, `StateMap.builder()`. Route targets,
-pooled-field safety, offline-requires-persistence, and quota configuration are all validated at
-build — typos die at startup, not as production DEBUG drops.
+Construction is **builder-only** everywhere, and the registry is **generic**:
+`StatemachineRegistry.<CallTask>builder(name)…build()` yields a `StatemachineRegistry<T>` whose
+`dispatch(id, T)`, `createFromFirstEvent(ev -> T)` and `quotaKeysExtractor(T -> keys)` are fully
+typed (T = the supervisor's context/task; children keep their own context types via
+`MachineSpec<C>`). Every per-type behaviour is a **builder lambda**: constructor/factory
+(`supervisor(name, MySup::new, pool)` / `contextFactory`), state entry/exit actions
+(`.onEntry(...)`/`.onExit(...)`), transition guards + actions, timeout-stay actions, volatile
+loaders — and **`.resetHook(typeName, m -> …)`**: a per-type pool-return lambda that clears
+custom props and final-field caches after the framework reset (registering one legalises mutable
+props on that machine type, since the hook owns them; a hook throw drops the instance instead of
+recycling it dirty). Route targets, pooled-field safety, offline-requires-persistence, and quota
+configuration are all validated at build — typos die at startup, not as production DEBUG drops.
 
 ## Package map (v3)
 
 ```
 com.telcobright.statewalk
-├─ registry      Registry (builder-only), Supervisor, InternalEventResolver,
+├─ registry      StatemachineRegistry<T> (builder-only), Supervisor, InternalEventResolver,
 │                SupervisorSpec/MachineSpec, DispatchResult, QuotaKeys/QuotaLimits/RejectCause
 ├─ machine       Machine (epoch + state-visit identity tokens, forced failover)
 ├─ state         StateMap/StateConfig (guards + transition actions, mandatory timeouts)
@@ -66,6 +74,8 @@ com.telcobright.statewalk
 ## Migrating from v2 (`com.telcobright:statewalk-v2`)
 
 1. Coordinates: `com.telcobright:statewalk-v2:1.0-SNAPSHOT` → `com.telcobright:statewalk:3.0.0-SNAPSHOT`.
+   The registry class is `StatemachineRegistry<T>` (was `flat.Registry`); T is the supervisor's
+   context type: `StatemachineRegistry.<CallCtx>builder("call")…`.
 2. Packages: drop the `v2.` segment; `v2.flat.*` → `registry.*`; `v2.registry.api.{DispatchResult,
    QuotaKeys,QuotaLimits,RejectCause}` → `registry.*`; `v2.registry.consumes.*` → `event.*`.
 3. The legacy api stack (`registry.api.Registry`, `MultiRegistry`, `Statewalk`,

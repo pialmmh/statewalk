@@ -1,7 +1,7 @@
 package com.telcobright.statewalk.registry;
 
 /**
- * Outcome of a {@code Registry.dispatch} call. Successful dispatches return
+ * Outcome of a {@code StatemachineRegistry.dispatch} call. Successful dispatches return
  * {@link #ok()}; rejections carry a {@link RejectCause} the handler can use
  * to formulate a protocol-level response.
  */

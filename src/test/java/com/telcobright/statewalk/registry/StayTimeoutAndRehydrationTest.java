@@ -43,12 +43,12 @@ class StayTimeoutAndRehydrationTest {
     static final AtomicInteger WAITING_ENTRIES = new AtomicInteger();
     static final AtomicInteger EXPIRED_ENTRIES = new AtomicInteger();
 
-    private final List<Registry> open = new ArrayList<>();
+    private final List<StatemachineRegistry<Ctx>> open = new ArrayList<>();
 
     @AfterEach
-    void tearDown() { for (Registry r : open) r.shutdown(); }
+    void tearDown() { for (StatemachineRegistry<Ctx> r : open) r.shutdown(); }
 
-    private Registry track(Registry r) { open.add(r); return r; }
+    private StatemachineRegistry<Ctx> track(StatemachineRegistry<Ctx> r) { open.add(r); return r; }
 
     /** WAITING has a STAY-mode 150ms heartbeat that counts beats into the context. */
     private static SupervisorSpec<Ctx> staySpec() {
@@ -93,7 +93,7 @@ class StayTimeoutAndRehydrationTest {
     void stay_timeout_checkpoints_periodically_and_machine_stays() throws Exception {
         WAITING_ENTRIES.set(0);
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry reg = track(Registry.builder("stay-beat")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("stay-beat")
             .supervisor(staySpec(), 2)
             .persistence(store).rehydrate(true)
             .threads(2)
@@ -172,7 +172,7 @@ class StayTimeoutAndRehydrationTest {
             Ctx.class.getName(), SnapshotSerializer.contextToBase64Json(prior),
             System.currentTimeMillis(), "EXPIRED", System.currentTimeMillis() + 60_000L));
 
-        Registry reg = track(Registry.builder("rehy-live")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("rehy-live")
             .supervisor(targetSpec(60_000), 2)
             .persistence(store).rehydrate(true)
             .threads(2)
@@ -197,7 +197,7 @@ class StayTimeoutAndRehydrationTest {
             Ctx.class.getName(), SnapshotSerializer.contextToBase64Json(new Ctx()),
             System.currentTimeMillis() - 10_000L, "EXPIRED", System.currentTimeMillis() - 5_000L));
 
-        Registry reg = track(Registry.builder("rehy-late")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("rehy-late")
             .supervisor(targetSpec(8_000), 2)
             .persistence(store).rehydrate(true)
             .threads(2)
@@ -221,7 +221,7 @@ class StayTimeoutAndRehydrationTest {
             Ctx.class.getName(), SnapshotSerializer.contextToBase64Json(prior),
             System.currentTimeMillis() - 1_000L, null, System.currentTimeMillis() - 500L));
 
-        Registry reg = track(Registry.builder("rehy-stay")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("rehy-stay")
             .supervisor(staySpec(), 2)
             .persistence(store).rehydrate(true)
             .threads(2)
@@ -268,7 +268,7 @@ class StayTimeoutAndRehydrationTest {
                 .build())
             .routes(r -> r.selfHandle(Stop.class))
             .build();
-        Registry reg = track(Registry.builder("stay-override")
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("stay-override")
             .supervisor(spec, 2).threads(2).build());
 
         assertTrue(reg.dispatch("o-1", new Ctx()).accepted());

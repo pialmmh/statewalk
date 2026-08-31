@@ -3,7 +3,7 @@ package com.telcobright.statewalk.channel;
 import java.util.concurrent.CompletionStage;
 
 /**
- * Protocol I/O conduit between a {@link com.telcobright.statewalk.registry.Registry}
+ * Protocol I/O conduit between a {@link com.telcobright.statewalk.registry.StatemachineRegistry}
  * and an external system (FreeSWITCH ESL, sigtran, HTTP, Kafka, Redis streams, ...).
  *
  * <h2>Send/receive symmetry</h2>

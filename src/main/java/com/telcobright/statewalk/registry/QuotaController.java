@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Per-key concurrent + TPS quota tracker. Used by {@link Registry} to gate
+ * Per-key concurrent + TPS quota tracker. Used by {@link StatemachineRegistry} to gate
  * dispatch against {@link QuotaLimits} on partner / route dimensions.
  *
  * <h2>Concurrency model</h2>

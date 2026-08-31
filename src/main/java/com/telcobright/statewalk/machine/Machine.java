@@ -183,7 +183,7 @@ public abstract class Machine<C> implements Poolable {
     protected void onForcedFailover(String reason) {}
 
     // ─────────────────────────────────────────────────────────────────
-    // Registry binding (only a Registry may call)
+    // StatemachineRegistry binding (only a StatemachineRegistry may call)
     // ─────────────────────────────────────────────────────────────────
 
     /** @hidden */
@@ -192,7 +192,7 @@ public abstract class Machine<C> implements Poolable {
     }
 
     /** Framework-internal: returns the handle bound by the registry. Used by
-     * {@code Supervisor} to reach its owning Registry; typical user code
+     * {@code Supervisor} to reach its owning StatemachineRegistry; typical user code
      * has no reason to call this. */
     public final MachineRegistryHandle getRegistry() {
         return this.registry;
@@ -794,7 +794,7 @@ public abstract class Machine<C> implements Poolable {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Registry handle (lightweight back-reference; framework-owned)
+    // StatemachineRegistry handle (lightweight back-reference; framework-owned)
     // ─────────────────────────────────────────────────────────────────
 
     /**
@@ -825,7 +825,7 @@ public abstract class Machine<C> implements Poolable {
 
         /**
          * Called after every successful state transition (entry action ran).
-         * Registry hooks any cross-cutting concern off this notification:
+         * StatemachineRegistry hooks any cross-cutting concern off this notification:
          * persistence save, last-event-time update for hung detection,
          * metrics, custom listeners.
          *

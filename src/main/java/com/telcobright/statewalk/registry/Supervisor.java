@@ -83,16 +83,16 @@ public abstract class Supervisor<C> extends Machine<C> {
     public final InternalEventResolver resolver() { return resolver; }
 
     /**
-     * Framework-internal: get the {@link Registry} this supervisor is bound
-     * to. The cast assumes the supervisor is in a flat Registry — which is
+     * Framework-internal: get the {@link StatemachineRegistry} this supervisor is bound
+     * to. The cast assumes the supervisor is in a flat StatemachineRegistry — which is
      * the only legal placement.
      */
-    final Registry getOwningRegistry() {
+    final StatemachineRegistry getOwningRegistry() {
         var handle = getRegistry();
-        if (handle instanceof Registry.PerMachineHandle pmh) {
+        if (handle instanceof StatemachineRegistry.PerMachineHandle pmh) {
             return pmh.registry();
         }
         throw new IllegalStateException(
-            "Supervisor " + getMachineId() + " is not bound to a flat Registry");
+            "Supervisor " + getMachineId() + " is not bound to a flat StatemachineRegistry");
     }
 }

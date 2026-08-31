@@ -7,6 +7,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
@@ -44,11 +45,24 @@ public class ObjectPoolManager<T extends Poolable> {
     private final AtomicInteger capDrops;
     private final int maxPoolSize;
     private final Supplier<T> factory;
+    /** Optional caller-defined per-return cleanup — runs AFTER {@link Poolable#resetForReuse()}. */
+    private final Consumer<T> resetHook;
     private final String name;
 
     public ObjectPoolManager(String name, Supplier<T> factory, int maxPoolSize) {
+        this(name, factory, maxPoolSize, null);
+    }
+
+    /**
+     * @param resetHook optional lambda run on every return AFTER the object's
+     *                  own {@code resetForReuse()} — the place to clear custom
+     *                  props and final-field collection contents. A throw
+     *                  drops the instance (never recycled dirty).
+     */
+    public ObjectPoolManager(String name, Supplier<T> factory, int maxPoolSize, Consumer<T> resetHook) {
         this.name = name;
         this.factory = factory;
+        this.resetHook = resetHook;
         this.maxPoolSize = maxPoolSize;
         this.available = new ConcurrentLinkedQueue<>();
         // Poolable implementations don't override equals/hashCode, so this is
@@ -108,7 +122,9 @@ public class ObjectPoolManager<T extends Poolable> {
         }
         try {
             obj.resetForReuse();
+            if (resetHook != null) resetHook.accept(obj);
         } catch (RuntimeException e) {
+            LOG.warn("[{}] reset (or reset hook) threw — instance dropped: {}", name, e.toString());
             resetFailures.incrementAndGet();
             pooled.remove(obj);
             return;   // instance dropped; pool refills on next borrow

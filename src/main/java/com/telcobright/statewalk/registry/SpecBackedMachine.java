@@ -10,7 +10,7 @@ import com.telcobright.statewalk.state.StateMap;
  * {@link MachineSpec} layer (name + context factory + state graph).
  *
  * <p>Users do not subclass this. They author a {@link MachineSpec} and the
- * Registry instantiates {@code SpecBackedMachine} on every pool borrow.
+ * StatemachineRegistry instantiates {@code SpecBackedMachine} on every pool borrow.
  */
 public final class SpecBackedMachine<C> extends Machine<C> {
 

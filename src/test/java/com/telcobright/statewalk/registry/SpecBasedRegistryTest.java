@@ -132,13 +132,13 @@ class SpecBasedRegistryTest {
 
     // ── system under test ──────────────────────────────────────────
 
-    private Registry reg;
+    private StatemachineRegistry<SupCtx> reg;
 
     @AfterEach
     void tearDown() { if (reg != null) reg.shutdown(); }
 
-    private Registry build() {
-        return Registry.builder("spec-call")
+    private StatemachineRegistry<SupCtx> build() {
+        return StatemachineRegistry.<SupCtx>builder("spec-call")
             .supervisor(SUPERVISOR_SPEC, 4)
             .child(SIGNALING_SPEC, 4)
             .child(BALANCE_SPEC,   4)
@@ -214,7 +214,7 @@ class SpecBasedRegistryTest {
             .contextFactory(SigCtx::new)
             .stateMap(SIGNALING_STATES)
             .build();
-        assertThrows(IllegalStateException.class, () -> Registry.builder("spec-dup")
+        assertThrows(IllegalStateException.class, () -> StatemachineRegistry.<SupCtx>builder("spec-dup")
             .supervisor(SUPERVISOR_SPEC, 4)
             .child(dupNameAsSupervisor, 4)
             .build());

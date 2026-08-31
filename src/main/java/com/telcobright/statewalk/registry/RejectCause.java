@@ -9,7 +9,7 @@ package com.telcobright.statewalk.registry;
  * reports its own rejection conditions. The handler bridges the two.
  */
 public enum RejectCause {
-    /** Registry-wide {@code maxConcurrent} limit reached. */
+    /** StatemachineRegistry-wide {@code maxConcurrent} limit reached. */
     CAPACITY_EXCEEDED,
 
     /** Per-partner concurrent-machine quota reached. */
@@ -27,7 +27,7 @@ public enum RejectCause {
     /** Same machineId already active — likely a producer bug or replay. */
     DUPLICATE_ID,
 
-    /** Registry is in shutdown — refusing new work. */
+    /** StatemachineRegistry is in shutdown — refusing new work. */
     SHUTTING_DOWN,
 
     /** Builder hasn't initialised the registry yet. */

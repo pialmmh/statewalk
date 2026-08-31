@@ -9,7 +9,7 @@ import com.telcobright.statewalk.state.StateMap;
  * context type) come from the spec.
  *
  * <p>Users do not subclass this. They author a {@link SupervisorSpec} and the
- * Registry instantiates {@code SpecBackedSupervisor} on every pool borrow.
+ * StatemachineRegistry instantiates {@code SpecBackedSupervisor} on every pool borrow.
  *
  * <p>The spec's {@code routes} consumer runs in {@link Supervisor}'s
  * constructor — it is passed up so the resolver is fully wired before the

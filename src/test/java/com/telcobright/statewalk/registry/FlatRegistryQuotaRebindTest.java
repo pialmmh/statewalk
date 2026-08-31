@@ -29,7 +29,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * seen at packet #1, the user — the quota key — arrives at first login):
  *
  * <ol>
- *   <li>{@link Registry#rebindQuotaKeys} — atomic release-old + acquire-new,
+ *   <li>{@link StatemachineRegistry#rebindQuotaKeys} — atomic release-old + acquire-new,
  *       reject with rollback, counters exact under races;</li>
  *   <li>restore-path quota re-acquire — a restart (startup recovery) and a lazy
  *       rehydration both bring the slots back from the restored context, so the
@@ -89,31 +89,31 @@ class FlatRegistryQuotaRebindTest {
         return QuotaKeys.of(t.partner, t.route);
     }
 
-    private final List<Registry> open = new ArrayList<>();
+    private final List<StatemachineRegistry<Task>> open = new ArrayList<>();
 
     @AfterEach
-    void tearDown() { for (Registry r : open) r.shutdown(); }
+    void tearDown() { for (StatemachineRegistry<Task> r : open) r.shutdown(); }
 
-    private Registry.Builder builder(String name, QuotaLimits limits) {
-        return Registry.builder(name)
+    private StatemachineRegistry.Builder<Task> builder(String name, QuotaLimits limits) {
+        return StatemachineRegistry.<Task>builder(name)
             .supervisor("RebindSupervisor", RebindSupervisor::new, 128)
             .threads(4)
             .quotaKeysExtractor(FlatRegistryQuotaRebindTest::keysOf)
             .quotaLimits(limits);
     }
 
-    private Registry build(String name, QuotaLimits limits) {
-        Registry r = builder(name, limits).build();
+    private StatemachineRegistry<Task> build(String name, QuotaLimits limits) {
+        StatemachineRegistry<Task> r = builder(name, limits).build();
         open.add(r);
         return r;
     }
 
-    private static void dispatchAnon(Registry reg, String id) {
+    private static void dispatchAnon(StatemachineRegistry<Task> reg, String id) {
         DispatchResult d = reg.dispatch(id, new Task());
         assertTrue(d.accepted(), "anonymous dispatch must be accepted: " + d.rejectCause());
     }
 
-    private static void stop(Registry reg, String id) throws InterruptedException {
+    private static void stop(StatemachineRegistry<Task> reg, String id) throws InterruptedException {
         reg.onInboundEvent(id, new Stop());
         assertTrue(reg.awaitIdle(5, TimeUnit.SECONDS));
     }
@@ -125,7 +125,7 @@ class FlatRegistryQuotaRebindTest {
     @Test
     void anonymous_machine_binds_at_first_login_and_terminal_release_frees_the_rebound_keys()
             throws InterruptedException {
-        Registry reg = build("rb-bind", new QuotaLimits(3, 2, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-bind", new QuotaLimits(3, 2, 0, 0));
         dispatchAnon(reg, "mac-1");
         assertTrue(reg.awaitIdle(5, TimeUnit.SECONDS));
         assertEquals(QuotaKeys.NONE, reg.quotaKeysOf("mac-1"));
@@ -147,7 +147,7 @@ class FlatRegistryQuotaRebindTest {
     @Test
     void rebind_at_partner_cap_is_rejected_and_the_old_binding_survives_with_exact_counters()
             throws InterruptedException {
-        Registry reg = build("rb-cap", new QuotaLimits(2, 0, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-cap", new QuotaLimits(2, 0, 0, 0));
         for (String id : List.of("a", "b", "c")) dispatchAnon(reg, id);
         assertTrue(reg.awaitIdle(5, TimeUnit.SECONDS));
 
@@ -176,7 +176,7 @@ class FlatRegistryQuotaRebindTest {
     @Test
     void reject_on_the_route_dimension_rolls_back_the_partner_acquire() throws InterruptedException {
         // partner cap wide open, one device per (user, zone)
-        Registry reg = build("rb-route", new QuotaLimits(10, 1, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-route", new QuotaLimits(10, 1, 0, 0));
         dispatchAnon(reg, "d1");
         dispatchAnon(reg, "d2");
         assertTrue(reg.awaitIdle(5, TimeUnit.SECONDS));
@@ -197,7 +197,7 @@ class FlatRegistryQuotaRebindTest {
 
     @Test
     void rebind_between_partners_moves_the_slot_and_same_keys_is_idempotent() throws InterruptedException {
-        Registry reg = build("rb-move", new QuotaLimits(1, 0, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-move", new QuotaLimits(1, 0, 0, 0));
         dispatchAnon(reg, "m");
         assertTrue(reg.awaitIdle(5, TimeUnit.SECONDS));
 
@@ -216,7 +216,7 @@ class FlatRegistryQuotaRebindTest {
 
     @Test
     void rebind_of_an_unknown_or_terminated_request_throws() throws InterruptedException {
-        Registry reg = build("rb-unknown", new QuotaLimits(1, 0, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-unknown", new QuotaLimits(1, 0, 0, 0));
         assertThrows(IllegalStateException.class, () -> reg.rebindQuotaKeys("nope", QuotaKeys.ofPartner("p")));
 
         dispatchAnon(reg, "gone");
@@ -230,7 +230,7 @@ class FlatRegistryQuotaRebindTest {
     void dispatch_time_keys_are_the_old_keys_a_rebind_releases() throws InterruptedException {
         // A returning device (known MAC) binds at dispatch through the stock gate;
         // a later rebind (e.g. identity correction) must release THOSE keys.
-        Registry reg = build("rb-known", new QuotaLimits(1, 0, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-known", new QuotaLimits(1, 0, 0, 0));
         assertTrue(reg.dispatch("known", new Task("u9", null)).accepted());
         assertTrue(reg.awaitIdle(5, TimeUnit.SECONDS));
         assertEquals(1, reg.quotaPartnerActive("u9"));
@@ -250,7 +250,7 @@ class FlatRegistryQuotaRebindTest {
     @Test
     void concurrent_rebind_race_admits_exactly_the_cap() throws Exception {
         final int N = 64, CAP = 3;
-        Registry reg = build("rb-race", new QuotaLimits(CAP, 0, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-race", new QuotaLimits(CAP, 0, 0, 0));
         for (int i = 0; i < N; i++) dispatchAnon(reg, "r-" + i);
         assertTrue(reg.awaitIdle(10, TimeUnit.SECONDS));
 
@@ -291,7 +291,7 @@ class FlatRegistryQuotaRebindTest {
     @Test
     void concurrent_flapping_rebinds_keep_the_counters_exact() throws Exception {
         final int N = 16, FLIPS = 200;
-        Registry reg = build("rb-flap", new QuotaLimits(100, 100, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-flap", new QuotaLimits(100, 100, 0, 0));
         for (int i = 0; i < N; i++) dispatchAnon(reg, "f-" + i);
         assertTrue(reg.awaitIdle(10, TimeUnit.SECONDS));
 
@@ -317,7 +317,7 @@ class FlatRegistryQuotaRebindTest {
     @Test
     void rebind_racing_a_terminal_release_never_leaks_a_slot() throws Exception {
         final int ROUNDS = 200;
-        Registry reg = build("rb-term-race", new QuotaLimits(1000, 0, 0, 0));
+        StatemachineRegistry<Task> reg = build("rb-term-race", new QuotaLimits(1000, 0, 0, 0));
         for (int i = 0; i < ROUNDS; i++) dispatchAnon(reg, "t-" + i);
         assertTrue(reg.awaitIdle(10, TimeUnit.SECONDS));
 
@@ -339,7 +339,7 @@ class FlatRegistryQuotaRebindTest {
     @Test
     void startup_recovery_reacquires_quota_from_restored_contexts() throws Exception {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry a = builder("rb-restore", new QuotaLimits(2, 0, 0, 0))
+        StatemachineRegistry<Task> a = builder("rb-restore", new QuotaLimits(2, 0, 0, 0))
             .persistence(store).rehydrate(true).build();
         open.add(a);
 
@@ -355,7 +355,7 @@ class FlatRegistryQuotaRebindTest {
         assertEquals(2, store.loadAllForRegistry("rb-restore").size(), "both live snapshots in the store");
 
         // "crash": a fresh registry on the same store (no shutdown → snapshots survive)
-        Registry b = builder("rb-restore", new QuotaLimits(2, 0, 0, 0))
+        StatemachineRegistry<Task> b = builder("rb-restore", new QuotaLimits(2, 0, 0, 0))
             .persistence(store).rehydrate(true).build();
         open.add(b);
         assertTrue(b.awaitIdle(5, TimeUnit.SECONDS));
@@ -378,7 +378,7 @@ class FlatRegistryQuotaRebindTest {
     @Test
     void lazy_rehydration_reacquires_quota_too() throws Exception {
         InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
-        Registry a = builder("rb-lazy", new QuotaLimits(1, 0, 0, 0))
+        StatemachineRegistry<Task> a = builder("rb-lazy", new QuotaLimits(1, 0, 0, 0))
             .persistence(store).rehydrate(true).build();
         open.add(a);
         assertTrue(a.dispatch("l-1", new Task("u1", null)).accepted());
@@ -391,7 +391,7 @@ class FlatRegistryQuotaRebindTest {
             @Override public List<MachineSnapshot> loadAll(String id) { return store.loadAll(id); }
             @Override public void delete(String id, String reg) { store.delete(id, reg); }
         };
-        Registry b = builder("rb-lazy", new QuotaLimits(1, 0, 0, 0))
+        StatemachineRegistry<Task> b = builder("rb-lazy", new QuotaLimits(1, 0, 0, 0))
             .persistence(lazyOnly).rehydrate(true).build();
         open.add(b);
         assertFalse(b.hasAny("l-1"), "nothing restored at startup on purpose");
@@ -417,7 +417,7 @@ class FlatRegistryQuotaRebindTest {
         store.save(new MachineSnapshot("old-1", "rb-matured", "RUNNING", Task.class.getName(), ctxB64,
             System.currentTimeMillis() - 10_000, "DONE", System.currentTimeMillis() - 5_000));
 
-        Registry b = builder("rb-matured", new QuotaLimits(3, 3, 0, 0))
+        StatemachineRegistry<Task> b = builder("rb-matured", new QuotaLimits(3, 3, 0, 0))
             .persistence(store).rehydrate(true).build();
         open.add(b);
         assertTrue(b.awaitIdle(5, TimeUnit.SECONDS));
@@ -436,7 +436,7 @@ class FlatRegistryQuotaRebindTest {
         store.save(new MachineSnapshot("n-1", "rb-nolimit", "RUNNING", Task.class.getName(), ctxB64,
             System.currentTimeMillis(), "DONE", System.currentTimeMillis() + 3_600_000L));
 
-        Registry b = builder("rb-nolimit", QuotaLimits.UNLIMITED)
+        StatemachineRegistry<Task> b = builder("rb-nolimit", QuotaLimits.UNLIMITED)
             .persistence(store).rehydrate(true).build();
         open.add(b);
         assertTrue(b.awaitIdle(5, TimeUnit.SECONDS));

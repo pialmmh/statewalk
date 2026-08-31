@@ -1,7 +1,7 @@
 package com.telcobright.statewalk.session;
 
 import com.telcobright.statewalk.registry.InternalEventResolver;
-import com.telcobright.statewalk.registry.Registry;
+import com.telcobright.statewalk.registry.StatemachineRegistry;
 import com.telcobright.statewalk.event.StatemachineEvent;
 import com.telcobright.statewalk.session.events.ServiceEnd;
 import com.telcobright.statewalk.session.events.SettleRequest;
@@ -126,11 +126,11 @@ class SessionSupervisorBaseTest {
 
     // ── harness ─────────────────────────────────────────────────────
 
-    private final List<Registry> open = new ArrayList<>();
+    private final List<StatemachineRegistry<TestCtx>> open = new ArrayList<>();
     private final List<SdrRecord> sdrs = new CopyOnWriteArrayList<>();
 
-    private Registry build() {
-        Registry r = Registry.builder("session-base-test")
+    private StatemachineRegistry<TestCtx> build() {
+        StatemachineRegistry<TestCtx> r = StatemachineRegistry.<TestCtx>builder("session-base-test")
             .supervisor("TestSupervisor", () -> new TestSupervisor(sdrs::add), 16)
             .child("Sig", Sig::new, 16)
             .child("Budget", Budget::new, 16)
@@ -141,7 +141,7 @@ class SessionSupervisorBaseTest {
     }
 
     @AfterEach
-    void tearDown() { for (Registry r : open) r.shutdown(); }
+    void tearDown() { for (StatemachineRegistry<TestCtx> r : open) r.shutdown(); }
 
     private SdrRecord awaitSdr(long timeoutMs) throws InterruptedException {
         long until = System.currentTimeMillis() + timeoutMs;
@@ -165,7 +165,7 @@ class SessionSupervisorBaseTest {
 
     @Test
     void full_success_path_writes_one_sdr_with_full_cell_history() throws Exception {
-        Registry reg = build();
+        StatemachineRegistry<TestCtx> reg = build();
         TestCtx ctx = new TestCtx();
         ctx.sessionKey = "k-1";
         assertTrue(reg.dispatch("k-1", ctx).accepted());
@@ -198,7 +198,7 @@ class SessionSupervisorBaseTest {
 
     @Test
     void admission_reject_ends_failed_with_sdr() throws Exception {
-        Registry reg = build();
+        StatemachineRegistry<TestCtx> reg = build();
         TestCtx ctx = new TestCtx();
         ctx.sessionKey = "k-2";
         ctx.admitReject = true;
@@ -213,7 +213,7 @@ class SessionSupervisorBaseTest {
 
     @Test
     void silent_session_is_ejected_as_failed_call_with_sdr() throws Exception {
-        Registry reg = build();
+        StatemachineRegistry<TestCtx> reg = build();
         TestCtx ctx = new TestCtx();
         ctx.sessionKey = "k-3";
         assertTrue(reg.dispatch("k-3", ctx).accepted());
@@ -228,7 +228,7 @@ class SessionSupervisorBaseTest {
 
     @Test
     void signaling_failure_without_retry_ends_failed_with_cause() throws Exception {
-        Registry reg = build();
+        StatemachineRegistry<TestCtx> reg = build();
         TestCtx ctx = new TestCtx();
         ctx.sessionKey = "k-4";
         assertTrue(reg.dispatch("k-4", ctx).accepted());
@@ -243,7 +243,7 @@ class SessionSupervisorBaseTest {
 
     @Test
     void sync_settle_domain_completes_without_budget_child() throws Exception {
-        Registry reg = build();
+        StatemachineRegistry<TestCtx> reg = build();
         TestCtx ctx = new TestCtx();
         ctx.sessionKey = "k-5";
         ctx.noBudget = true;
@@ -267,7 +267,7 @@ class SessionSupervisorBaseTest {
         // the third spawn dead — the session hung. v3: the base retires the
         // failed attempt's children (claims are immediate) and respawns the
         // SAME type name safely.
-        Registry reg = build();
+        StatemachineRegistry<TestCtx> reg = build();
         TestCtx ctx = new TestCtx();
         ctx.sessionKey = "k-retry";
         ctx.retryOnce = true;
@@ -297,7 +297,7 @@ class SessionSupervisorBaseTest {
     void shutdown_emits_an_sdr_for_every_live_session() throws Exception {
         // v2 shutdown reset supervisors straight to IDLE: no SDR, no teardown.
         // v3 drives every live session through its failover state first.
-        Registry reg = build();
+        StatemachineRegistry<TestCtx> reg = build();
         TestCtx a = new TestCtx(); a.sessionKey = "k-shut-a";
         TestCtx b = new TestCtx(); b.sessionKey = "k-shut-b";
         assertTrue(reg.dispatch("k-shut-a", a).accepted());
@@ -322,7 +322,7 @@ class SessionSupervisorBaseTest {
     void buildSdr_throw_still_ships_a_fallback_sdr() throws Exception {
         // v2 swallowed the throw inside one empty catch — the record vanished
         // unloggably. v3 ships the envelope without the domain payload.
-        Registry reg = build();
+        StatemachineRegistry<TestCtx> reg = build();
         TestCtx ctx = new TestCtx();
         ctx.sessionKey = "k-boom";
         ctx.sdrBoom = true;

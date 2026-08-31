@@ -6,7 +6,7 @@ import java.util.function.Supplier;
 
 /**
  * Declarative specification for a non-supervisor {@link com.telcobright.statewalk.machine.Machine}
- * registered in a {@link Registry}. Bundles the three things that vary per
+ * registered in a {@link StatemachineRegistry}. Bundles the three things that vary per
  * machine type — name, context factory, state graph — so a new protocol /
  * machine type can be added without writing a Machine subclass.
  *
@@ -14,7 +14,7 @@ import java.util.function.Supplier;
  * an instance (statewalk convention — no public constructors on framework
  * building blocks).
  *
- * <p>The {@code name} is the type's identity inside one Registry: it forms the
+ * <p>The {@code name} is the type's identity inside one StatemachineRegistry: it forms the
  * child portion of machine ids ({@code parentId#name}), keys the pool, and is
  * the target string used by {@link InternalEventResolver#forwardTo}.
  *

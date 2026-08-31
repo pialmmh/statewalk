@@ -62,7 +62,7 @@ public class TestChannel<O, I> implements Channel<O, I> {
         Inbound<I> g = gateway;
         if (g == null) {
             return CompletableFuture.failedFuture(new IllegalStateException(
-                "TestChannel '" + name + "' is not started — bind it to a Registry via .channel(...) "
+                "TestChannel '" + name + "' is not started — bind it to a StatemachineRegistry via .channel(...) "
                 + "or call start(gateway) first (injects must not be silently dropped)"));
         }
         return g.offer(requestId, event);

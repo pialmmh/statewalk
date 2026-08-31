@@ -6,7 +6,7 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
- * Declarative specification for the {@link Supervisor} of a {@link Registry}.
+ * Declarative specification for the {@link Supervisor} of a {@link StatemachineRegistry}.
  *
  * <p>Builder-only construction: {@link #builder()} is the sole way to obtain
  * an instance.
@@ -15,9 +15,9 @@ import java.util.function.Supplier;
  * populates the {@link InternalEventResolver} when the supervisor instance is
  * constructed. The routes consumer references children by their
  * {@code MachineSpec.name()} string; every referenced name is validated
- * against the registered children at {@code Registry.builder().build()}.
+ * against the registered children at {@code StatemachineRegistry.builder().build()}.
  *
- * <p>One supervisor per Registry; the supervisor's {@code name} also names its
+ * <p>One supervisor per StatemachineRegistry; the supervisor's {@code name} also names its
  * pool and forms the machine id directly (no {@code #} suffix).
  *
  * <p>Example:

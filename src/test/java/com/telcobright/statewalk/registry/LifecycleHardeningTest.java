@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Lifecycle-hardening guards on {@link Registry} — the reusable
+ * Lifecycle-hardening guards on {@link StatemachineRegistry} — the reusable
  * memory-leak / GC protections that must hold for <em>every</em> protocol
  * added to the framework, not just the call protocol that exists today.
  *
@@ -99,7 +99,7 @@ class LifecycleHardeningTest {
     @Test
     void build_rejects_supervisor_with_nonfinal_instance_field() {
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
-            Registry.builder("h-leak-sup")
+            StatemachineRegistry.<Ctx>builder("h-leak-sup")
                 .supervisor("LeakySupervisor", LeakySupervisor::new, 2)
                 .build());
         assertTrue(ex.getMessage().contains("perCallLog"),
@@ -109,7 +109,7 @@ class LifecycleHardeningTest {
     @Test
     void build_rejects_child_with_nonfinal_instance_field() {
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
-            Registry.builder("h-leak-child")
+            StatemachineRegistry.<Ctx>builder("h-leak-child")
                 .supervisor(CLEAN_SUP, 2)
                 .child("LeakyChild", LeakyChild::new, 2)
                 .build());
@@ -119,7 +119,7 @@ class LifecycleHardeningTest {
 
     @Test
     void build_allows_final_config_field_on_custom_subclass() {
-        Registry reg = Registry.builder("h-config-ok")
+        StatemachineRegistry<Ctx> reg = StatemachineRegistry.<Ctx>builder("h-config-ok")
             .supervisor("ConfigOkSupervisor", () -> new ConfigOkSupervisor("cfg"), 2)
             .build();
         try {
@@ -131,7 +131,7 @@ class LifecycleHardeningTest {
 
     @Test
     void build_allows_spec_backed_types() {
-        Registry reg = Registry.builder("h-spec-ok").supervisor(CLEAN_SUP, 2).build();
+        StatemachineRegistry<Ctx> reg = StatemachineRegistry.<Ctx>builder("h-spec-ok").supervisor(CLEAN_SUP, 2).build();
         try {
             assertNotNull(reg, "spec-backed types carry only a final spec → always pass");
         } finally {
@@ -170,7 +170,7 @@ class LifecycleHardeningTest {
             now - 7_200_000L, "SETTLED", now - 3_600_000L));
         assertEquals(1, store.size());
 
-        Registry reg = Registry.builder("h-recover")
+        StatemachineRegistry<Ctx> reg = StatemachineRegistry.<Ctx>builder("h-recover")
             .supervisor(RECOVER_SUP, 2)
             .persistence(store)
             .rehydrate(true)
@@ -197,7 +197,7 @@ class LifecycleHardeningTest {
             Ctx.class.getName(), SnapshotSerializer.contextToBase64Json(new Ctx()),
             now, "SETTLED", now + 3_600_000L));
 
-        Registry reg = Registry.builder("h-recover2")
+        StatemachineRegistry<Ctx> reg = StatemachineRegistry.<Ctx>builder("h-recover2")
             .supervisor(RECOVER_SUP, 2)
             .persistence(store)
             .rehydrate(true)
@@ -279,7 +279,7 @@ class LifecycleHardeningTest {
     @Test
     void h1_persistenceWriteFailure_failsTheRequest() throws Exception {
         FailingPersistenceProvider store = new FailingPersistenceProvider();
-        Registry reg = Registry.builder("h1-fail")
+        StatemachineRegistry<Ctx> reg = StatemachineRegistry.<Ctx>builder("h1-fail")
             .supervisor(LONG_SUP, 4)
             .persistence(store)         // rehydrate intentionally off
             .threads(2)

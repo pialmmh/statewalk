@@ -3,7 +3,7 @@ package com.telcobright.statewalk.registry;
 /**
  * Keys identifying a request for quota-tracking purposes. Subclass registries
  * compute these from the task at dispatch time via
- * {@code Registry.quotaKeysFor(task)}.
+ * {@code StatemachineRegistry.quotaKeysFor(task)}.
  *
  * <p>Either field can be {@code null} — null disables that dimension's check
  * for this request. {@link #NONE} is the convenient "no quotas to enforce"

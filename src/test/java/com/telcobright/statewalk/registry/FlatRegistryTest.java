@@ -150,15 +150,15 @@ class FlatRegistryTest {
 
     // ── system under test ─────────────────────────────────────────────
 
-    private Registry reg;
+    private StatemachineRegistry<SupCtx> reg;
 
     @AfterEach
     void tearDown() {
         if (reg != null) reg.shutdown();
     }
 
-    private Registry build() {
-        return Registry.builder("call")
+    private StatemachineRegistry<SupCtx> build() {
+        return StatemachineRegistry.<SupCtx>builder("call")
             .supervisor("CallSupervisor", CallSupervisor::new, 4)
             .child("SignalingMachine",    SignalingMachine::new, 4)
             .child("BalanceMachine",      BalanceMachine::new,   4)
@@ -244,7 +244,7 @@ class FlatRegistryTest {
         // Send an event nobody registered a route for.
         record UnknownEvent(String uuid) implements StatemachineEvent {}
         // Note: this event class isn't registered with any framework-level
-        // event registry in the flat path (flat Registry doesn't require it).
+        // event registry in the flat path (flat StatemachineRegistry doesn't require it).
         reg.onInboundEvent(uuid, new UnknownEvent(uuid));
         assertTrue(reg.awaitIdle(2, TimeUnit.SECONDS));
 

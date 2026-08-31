@@ -17,7 +17,7 @@ import java.util.Set;
  * passed via {@link Supervisor#Supervisor(java.util.function.Consumer)}).
  *
  * <p>Targets are addressed by the child machine type's {@code name} string —
- * matching the {@link MachineSpec#name()} declared in the Registry builder.
+ * matching the {@link MachineSpec#name()} declared in the StatemachineRegistry builder.
  * No {@code Class} references here, so the resolver works uniformly for spec-
  * based and raw-factory child registrations.
  *

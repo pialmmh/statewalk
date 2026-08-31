@@ -92,15 +92,29 @@ public final class StateMap {
                     "initialState '" + initialState + "' is not a declared state");
             }
 
-            // Mandatory-timeout invariant: every user-declared state MUST have a timeout.
-            // IDLE is auto-injected and exempt; final states must still declare one
-            // (the framework intervenes on terminal entry, so the timer never fires,
-            // but the discipline of "every state has a fallback" is preserved).
+            // Mandatory-timeout invariant: every user-declared state MUST have a
+            // timeout — either a target-mode fallback (.timeout) or a stay-mode
+            // checkpoint (.timeoutStay). IDLE is auto-injected and exempt; final
+            // states must still declare a target-mode one (the framework
+            // intervenes on terminal entry, so the timer never fires, but the
+            // discipline of "every state has a fallback" is preserved).
             for (StateBuilder sb : stateBuilders.values()) {
-                if (sb.timeoutDuration <= 0 || sb.timeoutUnit == null || sb.timeoutTarget == null) {
+                boolean hasTimeout = sb.timeoutDuration > 0 && sb.timeoutUnit != null
+                    && (sb.timeoutStay || sb.timeoutTarget != null);
+                if (!hasTimeout) {
                     throw new IllegalStateException(
                         "State '" + sb.name + "' is missing a mandatory timeout. "
-                        + "Use .timeout(duration, unit, targetState) on every state.");
+                        + "Use .timeout(duration, unit, targetState) or "
+                        + ".timeoutStay(duration, unit[, action]) on every state.");
+                }
+                if (sb.timeoutStay && sb.timeoutTarget != null) {
+                    throw new IllegalStateException(
+                        "State '" + sb.name + "' declares BOTH .timeout(target) and .timeoutStay — pick one.");
+                }
+                if (sb.timeoutStay && sb.finalState) {
+                    throw new IllegalStateException(
+                        "State '" + sb.name + "' is final and cannot use .timeoutStay — final states "
+                        + "declare .timeout(duration, unit, <self>) by convention (the timer never fires).");
                 }
             }
 
@@ -115,18 +129,22 @@ public final class StateMap {
                         }
                     }
                 }
-                if (!IDLE.equals(sb.timeoutTarget)
+                if (!sb.timeoutStay
+                    && !IDLE.equals(sb.timeoutTarget)
                     && !stateBuilders.containsKey(sb.timeoutTarget)) {
                     throw new IllegalStateException(
                         "State '" + sb.name + "' timeout targets unknown state '" + sb.timeoutTarget + "'");
                 }
             }
 
-            // Timeout-target-final invariant: every state's timeout must point
-            // at a state declared with .finalState(). This makes timeout the
-            // safety-fallback that always lands the machine in a terminal
-            // state — never a half-progressed mid-flow state.
+            // Timeout-target-final invariant: every TARGET-mode timeout must
+            // point at a state declared with .finalState(). This makes timeout
+            // the safety-fallback that always lands the machine in a terminal
+            // state — never a half-progressed mid-flow state. Stay-mode
+            // timeouts opt out deliberately: they checkpoint and keep waiting
+            // (the registry's global lifetime timeout remains the hard cap).
             for (StateBuilder sb : stateBuilders.values()) {
+                if (sb.timeoutStay) continue;
                 if (IDLE.equals(sb.timeoutTarget)) {
                     throw new IllegalStateException(
                         "State '" + sb.name + "' timeout targets IDLE — timeout target must be a "
@@ -177,7 +195,9 @@ public final class StateMap {
 
             for (StateBuilder sb : stateBuilders.values()) {
                 StateConfig.Timeout to = sb.timeoutDuration > 0
-                    ? new StateConfig.Timeout(sb.timeoutDuration, sb.timeoutUnit, sb.timeoutTarget)
+                    ? (sb.timeoutStay
+                        ? new StateConfig.Timeout(sb.timeoutDuration, sb.timeoutUnit, null, true, sb.timeoutStayAction)
+                        : new StateConfig.Timeout(sb.timeoutDuration, sb.timeoutUnit, sb.timeoutTarget))
                     : null;
                 // Freeze each guarded-transition list so runtime walking is safe.
                 java.util.Map<Class<? extends StatemachineEvent>, java.util.List<StateConfig.GuardedTransition>> frozenTransitions =
@@ -221,6 +241,8 @@ public final class StateMap {
             private long timeoutDuration;
             private TimeUnit timeoutUnit;
             private String timeoutTarget;
+            private boolean timeoutStay;
+            private Consumer<Object> timeoutStayAction;
             private boolean finalState;
             private boolean offline;
             /** True once .interim() or .finalState() has been called. Builder rejects the state otherwise. */
@@ -315,6 +337,35 @@ public final class StateMap {
                 this.timeoutDuration = duration;
                 this.timeoutUnit = unit;
                 this.timeoutTarget = targetState;
+                return this;
+            }
+
+            /**
+             * Stay-mode timeout: on maturity the machine STAYS in this state —
+             * the context is re-persisted with the refreshed deadline and the
+             * timer re-arms for the next period. A periodic checkpoint instead
+             * of a terminal fallback, for states that legitimately wait
+             * indefinitely for events (the registry's global lifetime timeout
+             * remains the hard cap). On rehydration a deadline that matured
+             * during downtime checkpoints immediately and re-arms.
+             *
+             * <p>Mutually exclusive with {@link #timeout(long, TimeUnit, String)};
+             * not allowed on final states.
+             */
+            public StateBuilder timeoutStay(long duration, TimeUnit unit) {
+                return timeoutStay(duration, unit, null);
+            }
+
+            /**
+             * Stay-mode timeout with a per-period action (heartbeat work,
+             * counters, external keepalive). The action receives the machine;
+             * a throw is logged and never breaks the checkpoint cycle.
+             */
+            public StateBuilder timeoutStay(long duration, TimeUnit unit, Consumer<Object> onTimeoutStay) {
+                this.timeoutDuration = duration;
+                this.timeoutUnit = unit;
+                this.timeoutStay = true;
+                this.timeoutStayAction = onTimeoutStay;
                 return this;
             }
 

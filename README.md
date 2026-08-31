@@ -13,10 +13,17 @@ data sessions — anything that lives, times out, and must leave a record).
   previous session's stale work.
 - **Atomic lifecycle claims** per cell (LIVE → TERMINATING | SUSPENDING): exactly one owner runs
   a cell's retirement; request-id reuse and fast retry are first-class, not races.
-- Mandatory per-state timeouts (every state declares its failover target — always a final
-  state), a persisted **global lifetime cap** that survives restarts, quota admission with exact
-  counters (`rebindQuotaKeys` for anonymous-at-birth sessions binds acquire-before-release),
-  and entry-point backpressure (`maxPendingInbound`) instead of mid-pipeline drops.
+- **Mandatory per-state timeouts** in one of two modes: `.timeout(d, u, target)` — the classic
+  fallback to a final state — or `.timeoutStay(d, u[, action])` — the machine STAYS, runs the
+  per-period action (heartbeat/keepalive), re-persists the context with the refreshed deadline,
+  and re-arms (for states that legitimately wait indefinitely). A persisted **global lifetime
+  cap** survives restarts and remains the hard ceiling; quota admission with exact counters
+  (`rebindQuotaKeys` for anonymous-at-birth sessions binds acquire-before-release); entry-point
+  backpressure (`maxPendingInbound`) instead of mid-pipeline drops.
+- **Rehydration honours elapsed time, never replays entry actions**: the machine is seated
+  directly in its last saved state; a target-mode deadline that matured during downtime
+  transitions to its target immediately; a matured stay-mode deadline checkpoints immediately
+  and re-arms; an unmatured deadline is armed for the remaining slice only.
 - Persistence + rehydration: JDBC, **Redis** (optional `redis.clients:jedis`), in-memory.
   Crash-consistent: final-state snapshots are tombstones (a failed delete can never resurrect a
   finished session), rehydration failures are **quarantined** to a dead-letter area instead of

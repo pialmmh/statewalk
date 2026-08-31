@@ -46,7 +46,28 @@ public record StateConfig(
     boolean finalState,
     boolean offline
 ) {
-    public record Timeout(long duration, TimeUnit unit, String targetState) {}
+    /**
+     * A state's mandatory timeout — one of two modes:
+     * <ul>
+     *   <li><b>target</b> ({@code stay == false}): on maturity the machine
+     *       transitions to {@code targetState} (a final state, by builder
+     *       rule) — the classic fallback that always lands terminal.</li>
+     *   <li><b>stay</b> ({@code stay == true}, {@code targetState == null}):
+     *       on maturity the machine STAYS in the state — the optional
+     *       {@code onTimeoutStay} action runs (heartbeat / checkpoint work),
+     *       the context is re-persisted with the refreshed deadline, and the
+     *       timer re-arms for the next period. The state waits indefinitely
+     *       for events, checkpointing every period; the registry's global
+     *       lifetime timeout remains the hard cap.</li>
+     * </ul>
+     */
+    public record Timeout(long duration, TimeUnit unit, String targetState,
+                          boolean stay, Consumer<Object> onTimeoutStay) {
+        /** Target-mode timeout (the classic shape). */
+        public Timeout(long duration, TimeUnit unit, String targetState) {
+            this(duration, unit, targetState, false, null);
+        }
+    }
 
     /**
      * One transition option for an event class. A list of these is stored

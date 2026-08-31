@@ -509,22 +509,8 @@ public abstract class Machine<C> implements Poolable {
         // races in-flight events (per-cell serial invariant); the visit token
         // makes a late-queued timer for a left (or re-entered) state a no-op.
         if (next.timeout() != null && registry != null) {
-            StateConfig.Timeout to = next.timeout();
-            stateTimeoutFuture = registry.schedule(
-                machineId,
-                () -> {
-                    synchronized (this) {
-                        if (terminated || registry == null || stateVersion != visit) return;
-                    }
-                    fire(new TimeoutEvent(next.name(), to.targetState()));
-                    synchronized (this) {
-                        if (!terminated && registry != null && stateVersion == visit) {
-                            transitionTo(to.targetState());
-                        }
-                    }
-                },
-                to.duration(),
-                to.unit());
+            scheduleStateTimer(next, next.timeout(), visit,
+                next.timeout().unit().toMillis(next.timeout().duration()));
         }
 
         // 5. entry action
@@ -571,6 +557,63 @@ public abstract class Machine<C> implements Poolable {
     }
 
     /**
+     * Arm the current state's timer for {@code delayMs}. Two modes at fire
+     * time (both chain-routed and visit-token guarded):
+     * <ul>
+     *   <li><b>target</b>: fire a {@link TimeoutEvent} (a domain rule may
+     *       transition first and win), then — still in the same visit —
+     *       transition to the declared final target.</li>
+     *   <li><b>stay</b>: fire the {@link TimeoutEvent}, then — still in the
+     *       same visit — run the optional stay action, re-persist the context
+     *       with the refreshed deadline, and re-arm for the next full period
+     *       (a periodic checkpoint; the state keeps waiting for events).</li>
+     * </ul>
+     */
+    private void scheduleStateTimer(StateConfig state, StateConfig.Timeout to, long visit, long delayMs) {
+        stateTimeoutFuture = registry.schedule(
+            machineId,
+            () -> onStateTimerFired(state, to, visit),
+            delayMs,
+            java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    private void onStateTimerFired(StateConfig state, StateConfig.Timeout to, long visit) {
+        synchronized (this) {
+            if (terminated || registry == null || stateVersion != visit) return;
+        }
+        fire(new TimeoutEvent(state.name(), to.stay() ? null : to.targetState()));
+        synchronized (this) {
+            if (terminated || registry == null || stateVersion != visit) return;
+            if (to.stay()) {
+                runStayCheckpoint(state, to, visit);
+            } else {
+                transitionTo(to.targetState());
+            }
+        }
+    }
+
+    /**
+     * The stay-mode checkpoint ritual: action → persist with refreshed
+     * deadline → re-arm. Caller holds the monitor and has verified the visit.
+     */
+    private void runStayCheckpoint(StateConfig state, StateConfig.Timeout to, long visit) {
+        if (to.onTimeoutStay() != null) {
+            try { to.onTimeoutStay().accept(this); }
+            catch (RuntimeException e) {
+                LOG.warn("[{}] timeoutStay action threw in state={}: {}",
+                    machineId, currentState, e.toString());
+            }
+        }
+        if (terminated || registry == null || stateVersion != visit) return;   // action may have transitioned
+        long periodMs = to.unit().toMillis(to.duration());
+        long newDeadline = System.currentTimeMillis() + periodMs;
+        this.currentDeadlineMs = newDeadline;
+        this.currentTimeoutTarget = null;
+        registry.onStateTransitioned(machineId, currentState, newDeadline, null);
+        scheduleStateTimer(state, to, visit, periodMs);
+    }
+
+    /**
      * Framework-internal forced failover: drive a live machine to its current
      * state's declared timeout target (always a final state, per the builder
      * invariant) so that terminal-state work — the session SDR, the teardown
@@ -589,11 +632,13 @@ public abstract class Machine<C> implements Poolable {
             LOG.warn("[{}] onForcedFailover hook threw: {}", machineId, e.toString());
         }
         StateConfig.Timeout to = cur.timeout();
-        if (to == null || to.targetState() == null) {
-            // Unreachable for user states (mandatory-timeout invariant), but IDLE
-            // has no timeout: a started machine is never in IDLE, so just guard.
-            LOG.warn("[{}] forceFailover({}) from state={} — no timeout target; hard-terminating",
-                machineId, reason, currentState);
+        if (to == null || to.stay() || to.targetState() == null) {
+            // A stay-timeout state declares no failover target (it checkpoints
+            // instead of falling back) — a forced failover can only hard-stop
+            // it. Session-style machines should keep target-mode timeouts on
+            // every state precisely so this path never runs for them.
+            LOG.warn("[{}] forceFailover({}) from state={} — no timeout target (stay-mode or none); "
+                + "hard-terminating without terminal entry", machineId, reason, currentState);
             terminated = true;
             return;
         }
@@ -665,39 +710,41 @@ public abstract class Machine<C> implements Poolable {
         this.currentTimeoutTarget = timeoutTargetState;
 
         StateConfig saved = stateMap.get(savedStateName);
+        StateConfig.Timeout to = saved.timeout();
         long now = System.currentTimeMillis();
-        boolean timeoutFired = timeoutDeadlineMs > 0 && now >= timeoutDeadlineMs;
+        boolean matured = timeoutDeadlineMs > 0 && now >= timeoutDeadlineMs;
 
-        if (timeoutFired && timeoutTargetState != null) {
-            // The timeout matured during downtime. transitionTo will run
-            // saved's onExit and then the target final state's onEntry +
-            // termination. Per spec: rehydration must NOT replay saved's
-            // onEntry (already done before persistence) — we don't, because
-            // we set currentState directly above without invoking transitionTo.
-            transitionTo(timeoutTargetState);
-            return;
-        }
-
-        // Schedule remaining timeout (if any) — same chain routing + visit
-        // token as a normal state entry.
-        if (saved.timeout() != null && timeoutDeadlineMs > 0) {
-            long remainingMs = Math.max(0, timeoutDeadlineMs - now);
-            StateConfig.Timeout to = saved.timeout();
-            stateTimeoutFuture = registry.schedule(
-                machineId,
-                () -> {
-                    synchronized (this) {
-                        if (terminated || registry == null || stateVersion != visit) return;
-                    }
-                    fire(new TimeoutEvent(savedStateName, to.targetState()));
-                    synchronized (this) {
-                        if (!terminated && registry != null && stateVersion == visit) {
-                            transitionTo(to.targetState());
-                        }
-                    }
-                },
-                remainingMs,
-                java.util.concurrent.TimeUnit.MILLISECONDS);
+        if (to != null && to.stay()) {
+            // Stay-mode state: the elapsed downtime is honoured as checkpoints,
+            // not as a terminal fallback. Matured → run the checkpoint ritual
+            // NOW (action + re-persist + re-arm full period); still pending →
+            // arm the remaining slice; no persisted deadline → fresh period.
+            if (matured) {
+                runStayCheckpoint(saved, to, visit);
+            } else {
+                long delayMs = timeoutDeadlineMs > 0
+                    ? Math.max(0, timeoutDeadlineMs - now)
+                    : to.unit().toMillis(to.duration());
+                scheduleStateTimer(saved, to, visit, delayMs);
+            }
+        } else if (matured) {
+            // The timeout matured during downtime — the elapsed time counts:
+            // transition to the target immediately. transitionTo runs saved's
+            // onExit and then the target final state's onEntry + termination.
+            // Per spec: rehydration must NOT replay saved's onEntry (it already
+            // ran before persistence) — and it doesn't, because currentState
+            // was seated directly above without invoking transitionTo.
+            String target = timeoutTargetState != null
+                ? timeoutTargetState
+                : (to != null ? to.targetState() : null);
+            if (target != null) {
+                transitionTo(target);
+                return;
+            }
+        } else if (to != null && timeoutDeadlineMs > 0) {
+            // Schedule the REMAINING slice of the timeout — same chain routing
+            // + visit token as a normal state entry.
+            scheduleStateTimer(saved, to, visit, Math.max(0, timeoutDeadlineMs - now));
         }
 
         if (debugMode && LOG.isDebugEnabled()) {

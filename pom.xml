@@ -4,18 +4,11 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <parent>
-        <groupId>com.telcobright</groupId>
-        <artifactId>routesphere-parent</artifactId>
-        <version>1.0-SNAPSHOT</version>
-        <relativePath>../pom.xml</relativePath>
-    </parent>
-
     <groupId>com.telcobright</groupId>
     <artifactId>statewalk-v2</artifactId>
     <version>1.0-SNAPSHOT</version>
     <name>Statewalk v2</name>
-    <description>Registry-driven state machine framework with pooling, IDLE invariant, supervisor pattern, and channel-based protocol I/O. v1 scope: no persistence, no history.</description>
+    <description>Registry-driven state machine framework: pooling, supervisor/child cells, per-state timeouts, quota admission, persistence + rehydration, session base (generic SessionSupervisor + SDR + history). Standalone library repo since 2026-09-01; formerly routesphere/statewalk-v2.</description>
 
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
@@ -63,9 +56,14 @@
         <plugins>
             <plugin>
                 <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>21</release>
+                </configuration>
             </plugin>
             <plugin>
                 <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.3</version>
             </plugin>
         </plugins>
     </build>

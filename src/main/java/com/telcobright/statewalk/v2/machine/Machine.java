@@ -301,6 +301,31 @@ public abstract class Machine<C> implements Poolable {
     }
 
     /**
+     * Cause hint for the transition-history tap: the simple class name of the
+     * event currently being fired, consumed (and cleared) by the next
+     * {@link #transitionTo(String)}. An imperative transition chained from an
+     * entry action sees {@code null} (recorded as a chained hop). Framework
+     * field — set only inside the machine's synchronized fire path.
+     */
+    private String pendingCauseHint;
+
+    /**
+     * Transition-history tap (base extension #2, ratified 2026-08-31 — the
+     * session-supervisor SDR history). Called on EVERY state switch, right
+     * after the state field changes and BEFORE the new state's entry action
+     * runs, so chained transitions record in chronological order. Runs inside
+     * the machine's synchronized transition path: implementations must be
+     * allocation-light and must not throw (a throw is swallowed, never fails
+     * the transition). Default is a no-op — existing machines are unaffected.
+     *
+     * @param fromState state being left ({@code null} on the IDLE→initial hop)
+     * @param toState   state entered
+     * @param causeHint simple class name of the driving event, or {@code null}
+     *                  for an imperative/chained transition
+     */
+    protected void onTransitioned(String fromState, String toState, String causeHint) { }
+
+    /**
      * Fire an event into the machine. Routes through transition table or
      * stay action of the current state. Silently ignored if the current
      * state has no entry for the event class.
@@ -308,6 +333,7 @@ public abstract class Machine<C> implements Poolable {
     public final synchronized void fire(StatemachineEvent event) {
         if (!started || terminated || registry == null) return;
         StateConfig cur = stateMap.get(currentState);
+        pendingCauseHint = event.getClass().getSimpleName();
 
         if (debugMode && LOG.isDebugEnabled()) {
             LOG.debug("[{}] fire state={} event={} ctx={}",
@@ -401,6 +427,9 @@ public abstract class Machine<C> implements Poolable {
         StateConfig next = stateMap.get(target);
         String fromState = currentState;
         currentState = next.name();
+        String causeHint = pendingCauseHint;
+        pendingCauseHint = null;
+        try { onTransitioned(fromState, currentState, causeHint); } catch (RuntimeException ignored) {}
 
         if (debugMode && LOG.isDebugEnabled()) {
             LOG.debug("[{}] transition {} -> {} ctx={}",
@@ -604,6 +633,7 @@ public abstract class Machine<C> implements Poolable {
         currentState = StateMap.IDLE;
         currentDeadlineMs = 0L;
         currentTimeoutTarget = null;
+        pendingCauseHint = null;
     }
 
     // ─────────────────────────────────────────────────────────────────

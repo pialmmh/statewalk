@@ -5,10 +5,10 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.telcobright</groupId>
-    <artifactId>statewalk-v2</artifactId>
-    <version>1.0-SNAPSHOT</version>
-    <name>Statewalk v2</name>
-    <description>Registry-driven state machine framework: pooling, supervisor/child cells, per-state timeouts, quota admission, persistence + rehydration, session base (generic SessionSupervisor + SDR + history). Standalone library repo since 2026-09-01; formerly routesphere/statewalk-v2.</description>
+    <artifactId>statewalk</artifactId>
+    <version>3.0.0-SNAPSHOT</version>
+    <name>Statewalk</name>
+    <description>Registry-driven state machine framework: pooling, supervisor/child cells, per-state timeouts, quota admission, persistence + rehydration (JDBC/Redis/in-memory), session base (generic SessionSupervisor + SDR + history). v3: single core stack, per-borrow epoch identity, atomic cell lifecycle claims, chain-serialized timeouts, unconditional terminal guarantees. Standalone library repo since 2026-09-01; formerly routesphere/statewalk-v2.</description>
 
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
@@ -29,6 +29,16 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
             <version>2.17.1</version>
+        </dependency>
+
+        <!-- Redis persistence provider (optional — consumers who use
+             RedisPersistenceProvider add jedis themselves; everyone else
+             pays nothing). -->
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>5.2.0</version>
+            <optional>true</optional>
         </dependency>
 
         <!-- Tests: visible log output via slf4j-simple. -->

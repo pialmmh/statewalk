@@ -192,3 +192,30 @@ Key mechanisms another agent should know before touching the code:
 - Restore: single-flight per id, supervisor-snapshot-first, final-state
   snapshots are purge-only tombstones, failures quarantine to a dead-letter
   area (never delete), the persisted global deadline is re-armed.
+
+---
+
+# STATUS UPDATE #2 (2026-09-01): v3.0 API finalised and pushed
+
+All work is committed and pushed to origin/master (github.com:pialmmh/statewalk),
+commits fb2f293..96ac85e. 96 tests green. On top of the core rewrite:
+
+- The registry is now GENERIC and renamed: `StatemachineRegistry<T>`
+  (T = the supervisor's context/task type; typed dispatch/first-event/quota
+  extractor). Builder-only construction everywhere.
+- Builder lambdas per machine type: constructor/factory, `.resetHook(typeName,
+  m -> ...)` (pool-return cleanup; registering one legalises mutable props on
+  that type), `.volatileLoader`, `.preWarmContextClass(...)` (restored v2
+  param). State lambdas: onEntry/onExit, guards + transition actions, stay
+  handlers.
+- Timeouts: every state mandatory, two modes — `.timeout(d,u,finalTarget)` or
+  `.timeoutStay(d,u[,action])` (checkpoint: run action, re-persist context
+  with refreshed deadline, re-arm). Global lifetime timeout persisted.
+- Rehydration: seats saved state, never replays entry actions; matured target
+  deadline → immediate transition; matured stay deadline → immediate
+  checkpoint + re-arm; unmatured → remaining slice.
+
+NEXT (other repos, not started): migrate routesphere CallSupervisor/
+SmsSupervisor and wifi-sphere WifiSessionSupervisor onto
+com.telcobright:statewalk:3.0.0-SNAPSHOT session.SessionSupervisor —
+migration steps are in the statewalk README.

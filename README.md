@@ -5,6 +5,11 @@ data sessions — anything that lives, times out, and must leave a record).
 
 **Maven: `com.telcobright:statewalk:3.0.0-SNAPSHOT`** · Java 21 · Build: `mvn test`
 
+**→ Start with [GUIDE.md](GUIDE.md)** — the complete manual: concepts, the full builder
+API, persistence/recovery/hibernation, channels, quota, the session base, testing, and
+worked examples. A full reference application lives in
+[`examples/payment-gateway/`](examples/payment-gateway/).
+
 - One supervisor + child machines per session cell, driven serially on a per-cell FIFO chain
   (events, timers, and teardown all run in order — the serial invariant is structural, not
   best-effort).
@@ -51,11 +56,12 @@ props on that machine type, since the hook owns them; a hook throw drops the ins
 recycling it dirty). Route targets, pooled-field safety, offline-requires-persistence, and quota
 configuration are all validated at build — typos die at startup, not as production DEBUG drops.
 
-## Bundled domain library: `com.telcobright.paymentgw`
+## Example: the payment gateway (`examples/payment-gateway/`)
 
-A production-shaped payment-gateway library built ON statewalk (and its reference consumer) —
-extractable to its own artifact when needed. Slow external payment flows with resilient,
-fault-tolerant state tracking:
+A production-shaped payment-gateway library built ON statewalk — its reference consumer,
+shipped as a standalone example module (`com.telcobright:statewalk-example-payment-gateway`;
+build the library with `mvn install` first, then `mvn test` inside the example). Slow external
+payment flows with resilient, fault-tolerant state tracking:
 
 ```
 INITIATED ──► AWAITING_PAYMENT ──ok──► CAPTURED ──refund──► REFUNDING ──► REFUNDED
@@ -92,9 +98,13 @@ com.telcobright.statewalk
 ├─ timeout       TimeoutManager
 ├─ executor      BoundedVirtualThreadExecutor
 └─ pipeline      ProcessingStep, StepMode
+```
 
-com.telcobright.paymentgw   PaymentGateway (facade), PaymentSupervisor, PaymentContext,
-                            PgwProviderClient (port), PaymentRecord/Sink, PaymentTimings, PaymentStatus
+Examples (separate modules, not part of the library jar):
+
+```
+examples/payment-gateway/   com.telcobright.paymentgw — PaymentGateway (facade),
+                            PaymentSupervisor, PgwProviderClient (port), PaymentRecord/Sink…
 ```
 
 ## Migrating from v2 (`com.telcobright:statewalk-v2`)

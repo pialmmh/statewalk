@@ -37,6 +37,7 @@ class StayTimeoutAndRehydrationTest {
 
     public record Stop(String u)  implements StatemachineEvent {}
     public record Nudge(String u) implements StatemachineEvent {}
+    public record Touch(String u) implements StatemachineEvent {}
 
     public static class Ctx { public int beats; public String mark; public Ctx() {} }
 
@@ -242,6 +243,85 @@ class StayTimeoutAndRehydrationTest {
         int beatsNow = ((Ctx) m.getContext()).beats;
         Thread.sleep(400);
         assertTrue(((Ctx) m.getContext()).beats > beatsNow, "re-armed timer keeps checkpointing");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Hibernation (.offline) at startup: db-only unless matured
+    // ─────────────────────────────────────────────────────────────
+
+    /** Offline graph: ACTIVE —Park→ PARKED(.offline, window to EXPIRED) —Stop→ DONE. */
+    private static SupervisorSpec<Ctx> hibernatingSpec(long windowSec) {
+        return SupervisorSpec.<Ctx>builder()
+            .name("Sup").contextFactory(Ctx::new)
+            .stateMap(StateMap.builder()
+                .initialState("ACTIVE")
+                .state("ACTIVE").interim().timeout(1, TimeUnit.HOURS, "EXPIRED")
+                    .on(Park.class, "PARKED")
+                .state("PARKED").interim().offline()
+                    .timeout(windowSec, TimeUnit.SECONDS, "EXPIRED")
+                    .on(Stop.class, "DONE")
+                    .stay(Touch.class, (self, e) -> ((Machine<Ctx>) self).getContext().beats++)
+                .state("DONE").finalState().timeout(1, TimeUnit.SECONDS, "DONE")
+                .state("EXPIRED").finalState().timeout(1, TimeUnit.SECONDS, "EXPIRED")
+                    .onEntry(self -> EXPIRED_ENTRIES.incrementAndGet())
+                .build())
+            .routes(r -> { r.selfHandle(Park.class); r.selfHandle(Stop.class); r.selfHandle(Touch.class); })
+            .build();
+    }
+
+    public record Park(String u) implements StatemachineEvent {}
+
+    @Test
+    void startup_leaves_unmatured_hibernated_sessions_db_only_and_settles_matured_ones() throws Exception {
+        EXPIRED_ENTRIES.set(0);
+        InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
+        StatemachineRegistry<Ctx> a = track(StatemachineRegistry.<Ctx>builder("hib-start")
+            .supervisor(hibernatingSpec(3600), 4)
+            .persistence(store).rehydrate(true).threads(2)
+            .build());
+        // two sessions parked with a LONG window…
+        for (String id : java.util.List.of("h-1", "h-2")) {
+            assertTrue(a.dispatch(id, new Ctx()).accepted());
+            a.onInboundEvent(id, new Park(id));
+        }
+        assertTrue(a.awaitIdle(5, TimeUnit.SECONDS));
+        assertEquals(0, a.activeIdCount(), "both hibernated on node A");
+        a.shutdown(); open.remove(a);
+
+        // …and one whose window MATURED during downtime (seeded snapshot).
+        store.save(new MachineSnapshot("h-old", "hib-start", "PARKED",
+            Ctx.class.getName(), SnapshotSerializer.contextToBase64Json(new Ctx()),
+            System.currentTimeMillis() - 10_000, "EXPIRED", System.currentTimeMillis() - 5_000));
+        assertEquals(3, store.size());
+
+        StatemachineRegistry<Ctx> b = track(StatemachineRegistry.<Ctx>builder("hib-start")
+            .supervisor(hibernatingSpec(3600), 4)
+            .persistence(store).rehydrate(true).threads(2)
+            .build());
+        assertTrue(b.awaitIdle(5, TimeUnit.SECONDS));
+
+        assertEquals(0, b.activeIdCount(),
+            "startup must NOT flood memory with hibernated sessions — they stay db-only");
+        assertEquals(1, EXPIRED_ENTRIES.get(), "…but the MATURED one was woken and settled");
+        assertEquals(2, store.size(), "h-old settled+purged; h-1/h-2 still hibernating");
+
+        // a hibernated one still wakes lazily on its next event
+        b.onInboundEvent("h-1", new Touch("h-1"));
+        assertTrue(b.awaitIdle(5, TimeUnit.SECONDS));
+        assertTrue(b.hasAny("h-1"), "lazy rehydration woke it");
+        assertEquals(1, ((Ctx) b.findInternal("h-1", "Sup").getContext()).beats);
+    }
+
+    @Test
+    void offline_graph_without_rehydrate_is_rejected_at_build() {
+        InMemoryPersistenceProvider store = new InMemoryPersistenceProvider();
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+            StatemachineRegistry.<Ctx>builder("hib-norehydrate")
+                .supervisor(hibernatingSpec(3600), 2)
+                .persistence(store)          // rehydrate deliberately OFF
+                .build());
+        assertTrue(ex.getMessage().contains("rehydrate"),
+            "a hibernating graph with no wake path must die at build: " + ex.getMessage());
     }
 
     // ─────────────────────────────────────────────────────────────

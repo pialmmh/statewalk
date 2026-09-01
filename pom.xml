@@ -60,6 +60,15 @@
             <version>3.46.0.1</version>
             <scope>test</scope>
         </dependency>
+        <!-- MySQL-backed rehydration tests (self-skip when no server on
+             127.0.0.1:3306). Connector 8.4.x — the last line supporting the
+             MySQL 5.7 servers still in the fleet; 9.x needs 8.0+. -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>8.4.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

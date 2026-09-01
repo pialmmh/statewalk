@@ -277,6 +277,12 @@ public final class StatemachineRegistry<T> {
                     + "persistence is configured — offline machines are suspended to (and resumed "
                     + "from) the store. Call .persistence(...).");
             }
+            if (!rehydrateEnabled && graph.hasOfflineState()) {
+                throw new IllegalStateException(
+                    "[" + name + "] type '" + typeName + "' declares an offline state but rehydration "
+                    + "is off — a suspended machine could hibernate and never wake. Call "
+                    + ".rehydrate(true) (persist-only mode is for recovery data of NON-offline graphs).");
+            }
             if (sample instanceof Supervisor<?> sup) {
                 for (String target : sup.resolver().referencedChildNames()) {
                     if (!types.containsKey(target) || target.equals(supervisorName)) {
@@ -759,6 +765,37 @@ public final class StatemachineRegistry<T> {
 
     public boolean hasAny(String parentId) { return active.containsKey(parentId); }
 
+    /**
+     * True while the id carries a finished-request tombstone — it reached a
+     * terminal state within the last few minutes (see the tombstone window).
+     * Lets callers distinguish "just finished" from "never seen" after the
+     * cells and snapshots are gone; beyond the window, consult your own
+     * record store (the SDR/record sink is the durable answer).
+     */
+    public boolean wasRecentlyFinished(String parentId) {
+        return recentlyFinished.containsKey(parentId);
+    }
+
+    /**
+     * The LIVE supervisor's current state for the id, or {@code null} when the
+     * request is not in memory (unknown, finished, or hibernated to the store —
+     * peek the store for the latter).
+     */
+    public String supervisorStateOf(String parentId) {
+        Cell cell = supervisorCell(parentId);
+        return cell != null ? cell.machine.getCurrentState() : null;
+    }
+
+    /**
+     * The LIVE supervisor's context for the id, or {@code null} when the
+     * request is not in memory. Typed — the supervisor's context IS {@code T}.
+     */
+    @SuppressWarnings("unchecked")
+    public T supervisorContextOf(String parentId) {
+        Cell cell = supervisorCell(parentId);
+        return cell != null ? (T) cell.machine.getContext() : null;
+    }
+
     public int activeIdCount() { return active.size(); }
 
     public int activeCellCount() {
@@ -1147,6 +1184,8 @@ public final class StatemachineRegistry<T> {
             name, unfinished.size(), byParent.size());
 
         int resumed = 0;
+        int hibernating = 0;
+        long now = System.currentTimeMillis();
         for (var e : byParent.entrySet()) {
             String parentId = e.getKey();
             MachineSnapshot supSnap = e.getValue().get(parentId);
@@ -1158,13 +1197,30 @@ public final class StatemachineRegistry<T> {
                 }
                 continue;
             }
+            // HIBERNATION: a supervisor parked in an .offline() state is
+            // db-only ON PURPOSE — startup must not flood memory with parked
+            // sessions. Leave it for lazy rehydration (an inbound event wakes
+            // it) UNLESS a deadline matured during downtime, in which case it
+            // is woken now so its expiry ritual runs.
+            if (isOfflineStateOf(supervisorName, supSnap.currentState())
+                    && !supSnap.timeoutFiredBy(now)
+                    && !supSnap.globalDeadlinePassedBy(now)) {
+                hibernating++;
+                continue;
+            }
             try { resumed += restoreAllCellsFor(parentId); }
             catch (RuntimeException ex) {
                 LOG.warn("[{}] startup recovery: resume failed for {}: {}", name, parentId, ex.toString());
             }
         }
-        LOG.info("[{}] startup recovery: {} cell(s) resumed (matured ones settle, the rest keep running)",
-            name, resumed);
+        LOG.info("[{}] startup recovery: {} cell(s) resumed (matured ones settle, the rest keep running); "
+            + "{} hibernating request(s) left db-only for lazy rehydration",
+            name, resumed, hibernating);
+    }
+
+    private boolean isOfflineStateOf(String typeName, String stateName) {
+        StateMap graph = typeStateMaps.get(typeName);
+        return graph != null && graph.has(stateName) && graph.get(stateName).offline();
     }
 
     /**

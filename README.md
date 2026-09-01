@@ -51,6 +51,29 @@ props on that machine type, since the hook owns them; a hook throw drops the ins
 recycling it dirty). Route targets, pooled-field safety, offline-requires-persistence, and quota
 configuration are all validated at build — typos die at startup, not as production DEBUG drops.
 
+## Bundled domain library: `com.telcobright.paymentgw`
+
+A production-shaped payment-gateway library built ON statewalk (and its reference consumer) —
+extractable to its own artifact when needed. Slow external payment flows with resilient,
+fault-tolerant state tracking:
+
+```
+INITIATED ──► AWAITING_PAYMENT ──ok──► CAPTURED ──refund──► REFUNDING ──► REFUNDED
+              (HIBERNATED: customer     (HIBERNATED:            │ declined/timeout
+               at the provider site)     refund window)         └──► back to CAPTURED
+              │ cancel / declined / window expired
+              ▼
+              CANCELLED / FAILED / EXPIRED          CAPTURED window closed ──► SETTLED
+```
+
+`PaymentGateway.builder(name).provider(pgwClient).recordSink(...).persistence(jdbcOrRedis)
+.timings(...)` → `initiatePayment` (returns the provider redirect URL), `onProviderCallback`,
+`cancel`, `requestRefund`, `status` (answers live, HIBERNATED and finished ids), `sweepExpired`.
+Every wait on the outside world is a hibernated store row — ZERO memory per waiting payment;
+callbacks rehydrate machine + context, across crashes: an external coordinator can activate a
+second instance on the same DB and the transaction continues there (tested against real MySQL).
+Every terminal outcome emits exactly one `PaymentRecord` with the full timeline.
+
 ## Package map (v3)
 
 ```
@@ -69,6 +92,9 @@ com.telcobright.statewalk
 ├─ timeout       TimeoutManager
 ├─ executor      BoundedVirtualThreadExecutor
 └─ pipeline      ProcessingStep, StepMode
+
+com.telcobright.paymentgw   PaymentGateway (facade), PaymentSupervisor, PaymentContext,
+                            PgwProviderClient (port), PaymentRecord/Sink, PaymentTimings, PaymentStatus
 ```
 
 ## Migrating from v2 (`com.telcobright:statewalk-v2`)

@@ -566,6 +566,61 @@ class RegistryHardeningV3Test {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // (11b) a SLOW store never blocks the hot path
+    // ─────────────────────────────────────────────────────────────
+
+    @Test
+    void slow_store_never_blocks_event_processing() throws Exception {
+        // Every WRITE to this store takes 800ms. Six writes will be queued
+        // (initial transition + 5 stays) — ~4.8s of store time — while the
+        // events themselves must land in a small fraction of ONE write.
+        InMemoryPersistenceProvider inner = new InMemoryPersistenceProvider();
+        PersistenceProvider slow = new PersistenceProvider() {
+            private void crawl() {
+                try { Thread.sleep(800); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            @Override public void save(MachineSnapshot s) { crawl(); inner.save(s); }
+            @Override public Optional<MachineSnapshot> load(String id, String r) { return inner.load(id, r); }
+            @Override public List<MachineSnapshot> loadAll(String id) { return inner.loadAll(id); }
+            @Override public void delete(String id, String r) { crawl(); inner.delete(id, r); }
+        };
+        StatemachineRegistry<Ctx> reg = track(StatemachineRegistry.<Ctx>builder("v3-slowstore")
+            .supervisor(SupervisorSpec.<Ctx>builder()
+                .name("Sup").contextFactory(Ctx::new).stateMap(runningGraph())
+                .routes(r -> { r.selfHandle(Stop.class); r.selfHandle(Touch.class); r.selfHandle(Ping.class); })
+                .build(), 2)
+            .persistence(slow)
+            .threads(2)
+            .build());
+
+        assertTrue(reg.dispatch("slow-1", new Ctx()).accepted());
+        long t0 = System.nanoTime();
+        for (int i = 0; i < 5; i++) reg.onInboundEvent("slow-1", new Touch("slow-1"));
+
+        // The hot path: all 5 events applied while the FIRST 800ms write is
+        // still in flight.
+        long budgetMs = 700;
+        long deadline = System.currentTimeMillis() + budgetMs;
+        Machine<?> m = null;
+        while (System.currentTimeMillis() < deadline) {
+            m = reg.findInternal("slow-1", "Sup");
+            if (m != null && ((Ctx) m.getContext()).touches == 5) break;
+            Thread.sleep(10);
+        }
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+        assertNotNull(m);
+        assertEquals(5, ((Ctx) m.getContext()).touches,
+            "all events processed while the store crawls (elapsed " + elapsedMs + "ms)");
+        assertTrue(elapsedMs < budgetMs,
+            "event processing must not wait on disk: took " + elapsedMs + "ms against 800ms/write");
+
+        // And the writes DO all land, in order, once the store catches up.
+        reg.onInboundEvent("slow-1", new Stop("slow-1"));
+        assertTrue(reg.awaitIdle(20, TimeUnit.SECONDS), "persist chains drain eventually");
+        assertEquals(0, inner.size(), "terminal delete landed after the queued saves");
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // (12) saturation soak: heavy concurrent dispatch+finish, no losses
     // ─────────────────────────────────────────────────────────────
 

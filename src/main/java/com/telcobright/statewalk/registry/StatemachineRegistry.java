@@ -1283,7 +1283,7 @@ public final class StatemachineRegistry<T> {
                     if (childOpt.isEmpty()) continue;
                     MachineSnapshot cs = childOpt.get();
                     if (isFinalStateOf(t, cs.currentState())) {
-                        try { persistence.delete(childId, name); } catch (RuntimeException ignored) {}
+                        submitDeleteWithRetry(childId, 1);       // async — never a store write on this thread
                         continue;
                     }
                     if (restoreOneCell(row, cs, t, parentId)) restored++;
@@ -1312,26 +1312,33 @@ public final class StatemachineRegistry<T> {
         return graph != null && graph.has(stateName) && graph.get(stateName).finalState();
     }
 
+    /**
+     * Queue tombstone purges on the persist executor — restore probing runs on
+     * wire threads (lazy rehydration), and NO store WRITE ever runs there.
+     */
     private void purgeAllSnapshots(String parentId) {
-        try { persistence.delete(parentId, name); } catch (RuntimeException e) {
-            LOG.warn("[{}] tombstone purge failed for {}: {}", name, parentId, e.toString());
-        }
+        submitDeleteWithRetry(parentId, 1);
         for (String t : types.keySet()) {
             if (t.equals(supervisorName)) continue;
-            try { persistence.delete(childId(parentId, t), name); } catch (RuntimeException ignored) {}
+            submitDeleteWithRetry(childId(parentId, t), 1);
         }
     }
 
     private void quarantineSnapshot(String machineId, String reason) {
         String parentId = isChildId(machineId)
             ? machineId.substring(0, machineId.indexOf(CHILD_ID_SEPARATOR)) : machineId;
+        // Block restore retries IMMEDIATELY (in-memory); the store write — like
+        // every store write — runs on the persist executor, ordered after any
+        // pending saves for the machine.
         quarantinedIds.put(parentId, System.currentTimeMillis());
-        try {
-            persistence.quarantine(machineId, name, reason);
-        } catch (RuntimeException e) {
-            LOG.error("[{}] quarantine of {} failed: {} — row left in place; id blocked from restore for {} min",
-                name, machineId, e.toString(), QUARANTINE_RETRY_MS / 60_000);
-        }
+        appendSerial(saveChains, machineId, persistWork, () -> {
+            try {
+                persistence.quarantine(machineId, name, reason);
+            } catch (RuntimeException e) {
+                LOG.error("[{}] quarantine of {} failed: {} — row left in place; id blocked from restore for {} min",
+                    name, machineId, e.toString(), QUARANTINE_RETRY_MS / 60_000);
+            }
+        });
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})

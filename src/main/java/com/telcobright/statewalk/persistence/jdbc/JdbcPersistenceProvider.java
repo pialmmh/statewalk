@@ -51,7 +51,6 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
     private final DataSource dataSource;
     private final String table;
     private final String deadTable;
-    private volatile boolean deadTableReady;
 
     public JdbcPersistenceProvider(DataSource dataSource) {
         this(dataSource, DEFAULT_TABLE);
@@ -62,6 +61,9 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
         this.table = table;
         this.deadTable = table + "_dead";
         ensureSchema();
+        ensureDeadTable();   // up-front: quarantines run CONCURRENTLY on the persist
+                             // executor, and racing CREATE TABLE IF NOT EXISTS loses
+                             // on MySQL — so the table must exist before any of them
     }
 
     private void ensureSchema() {
@@ -94,7 +96,6 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
     }
 
     private void ensureDeadTable() {
-        if (deadTableReady) return;
         String ddl = "CREATE TABLE IF NOT EXISTS " + deadTable + " ("
             + "machine_id           VARCHAR(255) NOT NULL, "
             + "registry_name        VARCHAR(255) NOT NULL, "
@@ -111,7 +112,6 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
             + ")";
         try (Connection c = dataSource.getConnection(); Statement s = c.createStatement()) {
             s.executeUpdate(ddl);
-            deadTableReady = true;
         } catch (SQLException e) {
             throw new RuntimeException("Dead-letter schema init failed for " + deadTable + ": " + e.getMessage(), e);
         }
@@ -262,7 +262,6 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
 
     @Override
     public void quarantine(String machineId, String registryName, String reason) {
-        ensureDeadTable();
         String copy = "INSERT INTO " + deadTable + " ("
             + "machine_id, registry_name, current_state, context_class, context_json_b64, "
             + "saved_at_ms, timeout_target_state, timeout_deadline_ms, global_deadline_ms, dead_reason, dead_at_ms) "

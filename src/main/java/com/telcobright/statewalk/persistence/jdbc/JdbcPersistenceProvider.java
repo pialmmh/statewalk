@@ -269,10 +269,21 @@ public class JdbcPersistenceProvider implements PersistenceProvider {
             + "saved_at_ms, timeout_target_state, timeout_deadline_ms, global_deadline_ms, ?, ? "
             + "FROM " + table + " WHERE machine_id=? AND registry_name=?";
         try (Connection c = dataSource.getConnection()) {
+            // Idempotence: a repeat quarantine for an id whose LIVE row is already
+            // gone must not touch the existing dead row — deleting it and copying
+            // nothing would destroy the data quarantine exists to preserve.
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT 1 FROM " + table + " WHERE machine_id=? AND registry_name=?")) {
+                ps.setString(1, machineId);
+                ps.setString(2, registryName);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return;
+                }
+            }
             boolean prevAuto = c.getAutoCommit();
             c.setAutoCommit(false);
             try {
-                // Idempotence: drop any previous dead row for the same key first.
+                // Replace any previous dead row for the same key.
                 try (PreparedStatement ps = c.prepareStatement(
                         "DELETE FROM " + deadTable + " WHERE machine_id=? AND registry_name=?")) {
                     ps.setString(1, machineId);

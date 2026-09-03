@@ -80,6 +80,15 @@ callbacks rehydrate machine + context, across crashes: an external coordinator c
 second instance on the same DB and the transaction continues there (tested against real MySQL).
 Every terminal outcome emits exactly one `PaymentRecord` with the full timeline.
 
+## C++ port: `routesphere-cpp/`
+
+The same framework in C++20 (header-only, no third-party deps; SQLite provider optional),
+built to run **inside the FreeSWITCH process** — no ESL: `statewalk::fs::FreeSwitchChannel`
+binds `switch_event_bind` and drives `switch_api_execute`. Same DSL, same guarantees
+(per-cell strands, epoch identity, hibernation, forced failover, async persistence). Build:
+`cd routesphere-cpp && cmake -B build && cmake --build build -j && ctest --test-dir build`.
+See `routesphere-cpp/README.md` for the Java↔C++ mapping and embedding notes.
+
 ## Package map (v3)
 
 ```

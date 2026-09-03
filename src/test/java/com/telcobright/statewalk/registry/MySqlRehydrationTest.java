@@ -426,6 +426,30 @@ class MySqlRehydrationTest {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // (7b) quarantine is idempotent — a repeat never destroys the dead row
+    // ─────────────────────────────────────────────────────────────
+
+    @Test
+    void repeated_quarantine_keeps_the_dead_row() throws Exception {
+        JdbcPersistenceProvider p = provider();
+        p.save(new MachineSnapshot("rq-1", "my-requarantine", "RUNNING",
+            Ctx.class.getName(), SnapshotSerializer.contextToBase64Json(new Ctx()),
+            System.currentTimeMillis(), "EXPIRED", System.currentTimeMillis() + 3_600_000L));
+        p.quarantine("rq-1", "my-requarantine", "first");
+        p.quarantine("rq-1", "my-requarantine", "again");     // live row already gone
+        try (Connection c = ds.getConnection();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT dead_reason FROM " + TABLE + "_dead WHERE machine_id=? AND registry_name=?")) {
+            ps.setString(1, "rq-1");
+            ps.setString(2, "my-requarantine");
+            try (var rs = ps.executeQuery()) {
+                assertTrue(rs.next(), "the dead row must survive a repeated quarantine (it did NOT before the fix)");
+                assertEquals("first", rs.getString(1), "and keep the ORIGINAL reason");
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // (8) orphan child row without a supervisor row
     // ─────────────────────────────────────────────────────────────
 
